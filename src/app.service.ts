@@ -2,6 +2,7 @@ import { Inject, Injectable, ServiceUnavailableException } from '@nestjs/common'
 import { Pool } from 'pg';
 import { SqsConsumerService } from './infrastructure/messaging/sqs-consumer.service';
 import { OutboxPublisherService } from './infrastructure/outbox/outbox-publisher.service';
+import { ApplicationMetrics } from './infrastructure/observability/application-metrics';
 
 type DependencyCheck = 'ok' | 'error';
 
@@ -40,6 +41,25 @@ export class AppService {
     }
 
     return response;
+  }
+
+  async getMetrics(): Promise<string> {
+    const [deadLetterMessages, outboxLag] = await Promise.all([
+      this.sqsConsumer.getDeadLetterQueueMessageCount(),
+      this.pool.query<{ lag_seconds: string | null }>(
+        `SELECT coalesce(
+           extract(epoch FROM (CURRENT_TIMESTAMP - min(created_at))),
+           0
+         ) AS lag_seconds
+         FROM outbox_events
+         WHERE published_at IS NULL`,
+      ),
+    ]);
+
+    return ApplicationMetrics.render({
+      sqs_dlq_messages: deadLetterMessages,
+      outbox_lag_seconds: Number(outboxLag.rows[0]?.lag_seconds ?? 0),
+    });
   }
 
   private toCheck<T>(result: PromiseSettledResult<T>): DependencyCheck {

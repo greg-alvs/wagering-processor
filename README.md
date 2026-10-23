@@ -71,6 +71,33 @@ uma verificação dentro do lock da wallet permitem somente uma reversão total
 (REFUND ou ROLLBACK) processada por referência; tentativas concorrentes adicionais
 são rejeitadas com `REFERENCE_ALREADY_REVERSED`.
 
+## Reconciliação de saldo
+
+`POST /wallets/:walletId/reconciliation` compara o saldo materializado com o saldo
+calculado como saldo de abertura mais créditos menos débitos do ledger. A migration
+persiste o saldo de abertura e faz backfill para as wallets existentes. Divergências
+são retornadas como `consistent: false`, registradas em log estruturado sem valores
+monetários e incrementam o contador Prometheus
+`wallet_reconciliation_divergences_total`, exposto em `GET /metrics`. A reconciliação
+é somente leitura e nunca corrige o saldo automaticamente. Para wallets anteriores
+à migration, o backfill deriva o saldo de abertura do saldo armazenado e dos
+lançamentos existentes; não é possível inferir divergências históricas anteriores
+à criação desse baseline.
+
+## Observabilidade
+
+`GET /metrics` expõe métricas Prometheus para transações por status, duplicatas,
+retries do consumidor SQS/outbox/reprocessador, mensagens visíveis na DLQ, contenção
+de lock da wallet, latência de processamento, espera por lock, atraso da outbox e
+divergências da reconciliação. Contagem de DLQ é aproximada conforme os atributos
+do SQS; atraso da outbox corresponde à idade do evento não publicado mais antigo.
+Contadores e histogramas são locais ao processo e devem ser agregados pelo
+Prometheus ao consultar múltiplas instâncias.
+
+Logs dos fluxos financeiros e workers são JSON e incluem IDs de correlação e de
+mensagem/transação/wallet/provider quando disponíveis. Não registram payloads nem
+valores monetários; erros são identificados por código/classe.
+
 ```powershell
 bunx mikro-orm migration:up
 docker compose up -d --build

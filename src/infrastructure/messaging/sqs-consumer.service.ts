@@ -11,14 +11,17 @@ import {
 } from '@aws-sdk/client-sqs';
 import { WageringService } from '../../wagering/wagering.service';
 import { PermanentMessageError, parseWagerTransactionMessage } from './wager-transaction-message';
+import { ApplicationMetrics } from '../observability/application-metrics';
 
 @Injectable()
 export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(SqsConsumerService.name);
   private readonly client: SQSClient;
   private readonly queueName: string;
+  private readonly dlqQueueName: string;
   private readonly consumerName: string;
   private queueUrl: string | undefined;
+  private dlqQueueUrl: string | undefined;
   private stopping = false;
   private polling: Promise<void> | undefined;
 
@@ -42,6 +45,7 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
 
     this.client = new SQSClient(clientConfig);
     this.queueName = config.get<string>('SQS_MAIN_QUEUE_NAME', 'wager-transactions.fifo');
+    this.dlqQueueName = config.get<string>('SQS_DLQ_QUEUE_NAME', 'wager-transactions-dlq.fifo');
     this.consumerName = config.get<string>('SQS_CONSUMER_NAME', 'wager-transaction-consumer');
   }
 
@@ -52,6 +56,13 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
     }
 
     this.queueUrl = queue.QueueUrl;
+    const deadLetterQueue = await this.client.send(
+      new GetQueueUrlCommand({ QueueName: this.dlqQueueName }),
+    );
+    if (!deadLetterQueue.QueueUrl) {
+      throw new Error(`SQS did not return a URL for dead-letter queue ${this.dlqQueueName}.`);
+    }
+    this.dlqQueueUrl = deadLetterQueue.QueueUrl;
     this.polling = this.poll();
   }
 
@@ -62,8 +73,8 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
   }
 
   async checkReady(): Promise<void> {
-    if (!this.queueUrl) {
-      throw new Error('SQS transaction queue has not been initialized.');
+    if (!this.queueUrl || !this.dlqQueueUrl) {
+      throw new Error('SQS transaction queues have not been initialized.');
     }
 
     await this.client.send(
@@ -72,6 +83,23 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
         AttributeNames: ['QueueArn'],
       }),
     );
+  }
+
+  async getDeadLetterQueueMessageCount(): Promise<number> {
+    if (!this.dlqQueueUrl) {
+      throw new Error('SQS dead-letter queue has not been initialized.');
+    }
+    const result = await this.client.send(
+      new GetQueueAttributesCommand({
+        QueueUrl: this.dlqQueueUrl,
+        AttributeNames: ['ApproximateNumberOfMessages'],
+      }),
+    );
+    const messageCount = result.Attributes?.ApproximateNumberOfMessages;
+    if (messageCount === undefined || !Number.isInteger(Number(messageCount)) || Number(messageCount) < 0) {
+      throw new Error(`SQS returned an invalid message count for dead-letter queue ${this.dlqQueueName}.`);
+    }
+    return Number(messageCount);
   }
 
   private async poll(): Promise<void> {
@@ -94,7 +122,10 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
         if (this.stopping) {
           break;
         }
-        this.logger.error(`SQS receive failed: ${this.errorMessage(error)}`);
+        ApplicationMetrics.increment('wager_retries_total', { component: 'sqs_consumer' });
+        this.logger.error(
+          JSON.stringify({ event: 'sqs_receive_failed', errorCode: this.errorCode(error) }),
+        );
         await this.delay(1000);
       }
     }
@@ -111,8 +142,12 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    let providerId: string | undefined;
+    let walletId: string | undefined;
     try {
       const dto = await parseWagerTransactionMessage(message.Body);
+      providerId = dto.providerId;
+      walletId = dto.walletId;
       const result = await this.wageringService.processQueueTransaction(dto, message.MessageId, this.consumerName);
 
       await this.client.send(
@@ -123,13 +158,30 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
       );
 
       if ('terminalFailure' in result && result.terminalFailure) {
-        this.logger.warn(`Acknowledged terminal business failure for message ${message.MessageId}.`);
+        this.logger.warn(
+          JSON.stringify({
+            event: 'sqs_terminal_business_failure_acknowledged',
+            correlationId: message.MessageId,
+            messageId: message.MessageId,
+            providerId,
+            walletId,
+          }),
+        );
       } else if ('duplicate' in result && result.duplicate) {
-        this.logger.log(`Acknowledged duplicate message ${message.MessageId}.`);
+        this.logger.log(
+          JSON.stringify({
+            event: 'sqs_duplicate_acknowledged',
+            correlationId: message.MessageId,
+            messageId: message.MessageId,
+            providerId,
+            walletId,
+          }),
+        );
       }
     } catch (error) {
       const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? 1);
       const visibilityTimeout = this.retryDelay(receiveCount);
+      ApplicationMetrics.increment('wager_retries_total', { component: 'sqs_consumer' });
       try {
         await this.client.send(
           new ChangeMessageVisibilityCommand({
@@ -140,13 +192,28 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
         );
       } catch (visibilityError) {
         this.logger.error(
-          `Could not schedule retry for message ${message.MessageId}: ${this.errorMessage(visibilityError)}`,
+          JSON.stringify({
+            event: 'sqs_retry_visibility_update_failed',
+            correlationId: message.MessageId,
+            messageId: message.MessageId,
+            errorCode: this.errorCode(visibilityError),
+          }),
         );
       }
 
       const category = error instanceof PermanentMessageError ? 'permanent' : 'transient';
       this.logger.error(
-        `${category} processing failure for message ${message.MessageId}; retry in ${visibilityTimeout}s: ${this.errorMessage(error)}`,
+        JSON.stringify({
+          event: 'sqs_message_retry_scheduled',
+          category,
+          correlationId: message.MessageId,
+          messageId: message.MessageId,
+          providerId,
+          walletId,
+          receiveCount,
+          retryDelaySeconds: visibilityTimeout,
+          errorCode: this.errorCode(error),
+        }),
       );
     }
   }
@@ -156,8 +223,11 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
     return Math.min(2 ** Math.min(attempt - 1, 8), 300);
   }
 
-  private errorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
+  private errorCode(error: unknown): string | undefined {
+    if (typeof error === 'object' && error !== null && 'code' in error) {
+      return String(error.code);
+    }
+    return error instanceof Error ? error.name : undefined;
   }
 
   private delay(milliseconds: number): Promise<void> {

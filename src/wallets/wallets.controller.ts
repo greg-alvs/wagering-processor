@@ -20,4 +20,10 @@ export class WalletsController {
   getLedger(@Param('walletId') walletId: string) {
     return this.walletsService.getLedger(walletId);
   }
+
+  @Post(':walletId/reconciliation')
+  reconcile(@Param('walletId') walletId: string) {
+    return this.walletsService.reconcile(walletId);
+  }
+
 }

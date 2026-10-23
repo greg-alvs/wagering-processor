@@ -1,4 +1,4 @@
-import { HttpException, Inject, Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { BadRequestException, HttpException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Pool, PoolClient } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { hashCanonicalJson } from '../domain/idempotency/canonical-payload';
@@ -10,10 +10,12 @@ import { InboxRepository } from '../infrastructure/messaging/inbox.repository';
 import { EventContext } from '../infrastructure/outbox/integration-event';
 import { OutboxRepository } from '../infrastructure/outbox/outbox.repository';
 import { eventsForTransaction, WalletBalanceChanged } from '../infrastructure/outbox/wager-transaction-events';
+import { ApplicationMetrics } from '../infrastructure/observability/application-metrics';
 import { CreateWagerTransactionDto } from './dto/create-transaction.dto';
 
 @Injectable()
 export class WageringService {
+  private readonly logger = new Logger(WageringService.name);
   private readonly inboxRepository = new InboxRepository();
   private readonly outboxRepository = new OutboxRepository();
 
@@ -40,6 +42,8 @@ export class WageringService {
     inbox?: { messageId: string; consumerName: string },
     eventContext: EventContext = { correlationId: randomUUID() },
   ) {
+    const startedAt = performance.now();
+    const source = inbox ? 'sqs' : 'http';
     const client = await this.pool.connect();
     let transactionStarted = false;
 
@@ -52,6 +56,10 @@ export class WageringService {
         if (!inserted) {
           await client.query('COMMIT');
           transactionStarted = false;
+          ApplicationMetrics.increment('wager_duplicates_total', { source: 'inbox' });
+          this.logTransaction('duplicate_message', dto, eventContext, undefined, {
+            messageId: inbox.messageId,
+          });
           return { duplicate: true as const };
         }
       }
@@ -63,17 +71,69 @@ export class WageringService {
         if (inbox && error instanceof HttpException && error.getStatus() >= 400 && error.getStatus() < 500) {
           await client.query('COMMIT');
           transactionStarted = false;
+          ApplicationMetrics.observe(
+            'wager_processing_duration_seconds',
+            (performance.now() - startedAt) / 1000,
+            { source },
+          );
+          this.logger.warn(
+            JSON.stringify({
+              event: 'transaction_terminal_business_failure',
+              correlationId: eventContext.correlationId,
+              messageId: inbox.messageId,
+              providerId: dto.providerId,
+              walletId: dto.walletId,
+              errorCode: this.errorCode(error),
+            }),
+          );
           return { terminalFailure: true as const };
         }
         throw error;
       }
       await client.query('COMMIT');
       transactionStarted = false;
+      if ('idempotentReplay' in result && result.idempotentReplay) {
+        ApplicationMetrics.increment('wager_duplicates_total', { source: 'idempotency' });
+        ApplicationMetrics.observe(
+          'wager_processing_duration_seconds',
+          (performance.now() - startedAt) / 1000,
+          { source },
+        );
+        const { idempotentReplay: _idempotentReplay, ...originalResult } = result;
+        this.logTransaction('idempotent_replay', dto, eventContext, {
+          status: originalResult.status,
+          responseHash: originalResult.responseHash,
+        }, {
+          messageId: inbox?.messageId,
+        });
+        return originalResult;
+      }
+      const status = 'status' in result ? String(result.status) : undefined;
+      if (status) {
+        ApplicationMetrics.increment('wager_transactions_total', { status });
+      }
+      ApplicationMetrics.observe('wager_processing_duration_seconds', (performance.now() - startedAt) / 1000, {
+        source,
+      });
+      this.logTransaction('transaction_committed', dto, eventContext, result, {
+        messageId: inbox?.messageId,
+      });
       return result;
     } catch (error) {
       if (transactionStarted) {
         await client.query('ROLLBACK');
       }
+      this.recordLockConflict(error);
+      this.logger.error(
+        JSON.stringify({
+          event: 'transaction_processing_failed',
+          correlationId: eventContext.correlationId,
+          messageId: inbox?.messageId,
+          providerId: dto.providerId,
+          walletId: dto.walletId,
+          errorCode: this.errorCode(error),
+        }),
+      );
       throw error;
     } finally {
       client.release();
@@ -94,6 +154,7 @@ export class WageringService {
       const samePayload = row.payload_hash === payloadHash;
       if (samePayload) {
         return {
+          idempotentReplay: true as const,
           id: row.id,
           status: row.response_hash ? 'PROCESSED' : 'PENDING',
           responseHash: row.response_hash,
@@ -103,7 +164,13 @@ export class WageringService {
       throw new BadRequestException('Idempotency key already used with different payload.');
     }
 
+    const walletLockStartedAt = performance.now();
     const walletRow = await client.query('SELECT * FROM wallets WHERE id = $1 FOR UPDATE', [dto.walletId]);
+    const walletLockWaitSeconds = (performance.now() - walletLockStartedAt) / 1000;
+    ApplicationMetrics.observe('wager_wallet_lock_wait_seconds', walletLockWaitSeconds);
+    if (walletLockWaitSeconds >= 0.025) {
+      ApplicationMetrics.increment('wallet_lock_conflicts_total');
+    }
     if (!walletRow.rowCount || walletRow.rowCount === 0) {
       throw new NotFoundException(`Wallet ${dto.walletId} not found.`);
     }
@@ -446,6 +513,40 @@ export class WageringService {
       failureCode: row.failure_code as FailureCode | undefined,
       processedAt: row.processed_at as Date | string | undefined,
     });
+  }
+
+  private logTransaction(
+    event: string,
+    dto: CreateWagerTransactionDto,
+    context: EventContext,
+    result?: Record<string, unknown>,
+    additional: { messageId?: string } = {},
+  ): void {
+    this.logger.log(
+      JSON.stringify({
+        event,
+        correlationId: context.correlationId,
+        messageId: additional.messageId,
+        transactionId: result?.transactionId ?? result?.id,
+        walletId: dto.walletId,
+        providerId: dto.providerId,
+        status: result?.status,
+      }),
+    );
+  }
+
+  private recordLockConflict(error: unknown): void {
+    const code = this.errorCode(error);
+    if (code === '40P01' || code === '55P03' || code === '40001') {
+      ApplicationMetrics.increment('wallet_lock_conflicts_total');
+    }
+  }
+
+  private errorCode(error: unknown): string | undefined {
+    if (typeof error === 'object' && error !== null && 'code' in error) {
+      return String(error.code);
+    }
+    return error instanceof Error ? error.name : undefined;
   }
 
   async getTransaction(transactionId: string) {

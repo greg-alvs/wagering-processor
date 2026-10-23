@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nest
 import { Pool } from 'pg';
 import { WagerTransactionStatus } from '../../domain/wagering/wager-transaction';
 import { WageringService } from '../../wagering/wagering.service';
+import { ApplicationMetrics } from '../observability/application-metrics';
 
 const POLL_INTERVAL_MS = 1000;
 const MAX_ATTEMPTS_PER_POLL = 100;
@@ -48,13 +49,20 @@ export class PendingReferenceWorkerService implements OnModuleInit, OnModuleDest
         }
       }
     } catch (error) {
-      this.logger.error('Pending reference processing failed.', error);
+      ApplicationMetrics.increment('wager_retries_total', { component: 'pending_reference' });
+      this.logger.error(
+        JSON.stringify({
+          event: 'pending_reference_worker_failed',
+          errorCode: this.errorCode(error),
+        }),
+      );
     } finally {
       this.schedule(POLL_INTERVAL_MS);
     }
   }
 
   async runOnce(): Promise<boolean> {
+    const startedAt = performance.now();
     const client = await this.pool.connect();
     let transactionStarted = false;
 
@@ -62,7 +70,7 @@ export class PendingReferenceWorkerService implements OnModuleInit, OnModuleDest
       await client.query('BEGIN');
       transactionStarted = true;
       const pendingResult = await client.query(
-        `SELECT id FROM wager_transactions
+        `SELECT id, provider_id, wallet_id FROM wager_transactions
          WHERE status = $1
            AND (
              reference_next_attempt_at IS NULL
@@ -81,9 +89,35 @@ export class PendingReferenceWorkerService implements OnModuleInit, OnModuleDest
         return false;
       }
 
-      await this.wageringService.reprocessPendingReference(client, pending.id, MAX_REFERENCE_ATTEMPTS);
+      const outcome = await this.wageringService.reprocessPendingReference(
+        client,
+        pending.id,
+        MAX_REFERENCE_ATTEMPTS,
+      );
       await client.query('COMMIT');
       transactionStarted = false;
+      if (outcome === 'rescheduled') {
+        ApplicationMetrics.increment('wager_retries_total', { component: 'pending_reference' });
+      } else {
+        ApplicationMetrics.increment('wager_transactions_total', {
+          status: outcome === 'processed' ? 'PROCESSED' : 'REJECTED',
+        });
+      }
+      ApplicationMetrics.observe(
+        'wager_processing_duration_seconds',
+        (performance.now() - startedAt) / 1000,
+        { source: 'pending_reference' },
+      );
+      this.logger.log(
+        JSON.stringify({
+          event: 'pending_reference_reprocessed',
+          correlationId: pending.id,
+          transactionId: pending.id,
+          walletId: pending.wallet_id,
+          providerId: pending.provider_id,
+          outcome,
+        }),
+      );
       return true;
     } catch (error) {
       if (transactionStarted) {
@@ -93,5 +127,12 @@ export class PendingReferenceWorkerService implements OnModuleInit, OnModuleDest
     } finally {
       client.release();
     }
+  }
+
+  private errorCode(error: unknown): string | undefined {
+    if (typeof error === 'object' && error !== null && 'code' in error) {
+      return String(error.code);
+    }
+    return error instanceof Error ? error.name : undefined;
   }
 }

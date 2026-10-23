@@ -9,6 +9,7 @@ export const Wallet = defineEntity({
     playerId: { type: 'varchar', length: 64, fieldName: 'player_id' },
     currency: { type: 'varchar', length: 8 },
     balance: { type: 'decimal', precision: 18, scale: 2, default: '0' },
+    openingBalance: { type: 'decimal', precision: 18, scale: 2, fieldName: 'opening_balance' },
     version: { type: 'integer', default: 1 },
     createdAt: { type: 'Date', fieldName: 'created_at', defaultRaw: 'CURRENT_TIMESTAMP' },
     updatedAt: {

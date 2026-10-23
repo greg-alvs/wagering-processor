@@ -7,6 +7,7 @@ import {
   SQSClient,
 } from '@aws-sdk/client-sqs';
 import { Pool } from 'pg';
+import { ApplicationMetrics } from '../observability/application-metrics';
 
 interface PendingOutboxEvent {
   event_id: string;
@@ -79,7 +80,10 @@ export class OutboxPublisherService implements OnModuleInit, OnModuleDestroy {
           await this.delay(1000);
         }
       } catch (error) {
-        this.logger.error(`Outbox polling failed: ${this.errorMessage(error)}`);
+        ApplicationMetrics.increment('wager_retries_total', { component: 'outbox_publisher' });
+        this.logger.error(
+          JSON.stringify({ event: 'outbox_poll_failed', errorCode: this.errorCode(error) }),
+        );
         await this.delay(1000);
       }
     }
@@ -136,6 +140,7 @@ export class OutboxPublisherService implements OnModuleInit, OnModuleDestroy {
       if (publicationFailed) {
         const attempts = Number(event.attempts) + 1;
         const delaySeconds = Math.min(2 ** Math.min(attempts - 1, 8), 300);
+        const context = this.eventLogContext(event.payload);
         await databaseClient.query(
           `UPDATE outbox_events
            SET attempts = attempts + 1,
@@ -145,8 +150,19 @@ export class OutboxPublisherService implements OnModuleInit, OnModuleDestroy {
         );
         await databaseClient.query('COMMIT');
         transactionStarted = false;
+        ApplicationMetrics.increment('wager_retries_total', { component: 'outbox_publisher' });
         this.logger.error(
-          `Outbox event ${event.event_id} publication failed; retry in ${delaySeconds}s: ${this.errorMessage(publicationError)}`,
+          JSON.stringify({
+            event: 'outbox_publish_retry_scheduled',
+            correlationId: context.correlationId,
+            eventId: event.event_id,
+            aggregateId: event.aggregate_id,
+            transactionId: context.transactionId,
+            walletId: context.walletId ?? event.aggregate_id,
+            providerId: context.providerId,
+            retryDelaySeconds: delaySeconds,
+            errorCode: this.errorCode(publicationError),
+          }),
         );
         return true;
       }
@@ -160,7 +176,18 @@ export class OutboxPublisherService implements OnModuleInit, OnModuleDestroy {
         );
         await databaseClient.query('COMMIT');
         transactionStarted = false;
-        this.logger.log(`Published outbox event ${event.event_id}.`);
+        const context = this.eventLogContext(event.payload);
+        this.logger.log(
+          JSON.stringify({
+            event: 'outbox_event_published',
+            correlationId: context.correlationId,
+            eventId: event.event_id,
+            aggregateId: event.aggregate_id,
+            transactionId: context.transactionId,
+            walletId: context.walletId ?? event.aggregate_id,
+            providerId: context.providerId,
+          }),
+        );
         return true;
       } catch (error) {
         throw error;
@@ -175,8 +202,32 @@ export class OutboxPublisherService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private errorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
+  private errorCode(error: unknown): string | undefined {
+    if (typeof error === 'object' && error !== null && 'code' in error) {
+      return String(error.code);
+    }
+    return error instanceof Error ? error.name : undefined;
+  }
+
+  private eventLogContext(payload: unknown): {
+    correlationId?: string;
+    transactionId?: string;
+    walletId?: string;
+    providerId?: string;
+  } {
+    if (typeof payload !== 'object' || payload === null) {
+      return {};
+    }
+    const event = payload as {
+      correlationId?: unknown;
+      data?: { transactionId?: unknown; walletId?: unknown; providerId?: unknown };
+    };
+    return {
+      correlationId: typeof event.correlationId === 'string' ? event.correlationId : undefined,
+      transactionId: typeof event.data?.transactionId === 'string' ? event.data.transactionId : undefined,
+      walletId: typeof event.data?.walletId === 'string' ? event.data.walletId : undefined,
+      providerId: typeof event.data?.providerId === 'string' ? event.data.providerId : undefined,
+    };
   }
 
   private delay(milliseconds: number): Promise<void> {
