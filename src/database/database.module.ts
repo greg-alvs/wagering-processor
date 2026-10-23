@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { PostgreSqlDriver } from '@mikro-orm/postgresql';
+import { Pool } from 'pg';
 
 @Module({
   imports: [
@@ -29,5 +30,23 @@ import { PostgreSqlDriver } from '@mikro-orm/postgresql';
       }),
     }),
   ],
+  providers: [
+    {
+      provide: 'DATABASE_POOL',
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) =>
+        new Pool({
+          host: config.get<string>('POSTGRES_HOST', 'localhost'),
+          port: Number(config.get<number>('POSTGRES_PORT', 5432)),
+          user: config.get<string>('POSTGRES_USER', 'postgres'),
+          password: config.get<string>('POSTGRES_PASSWORD', 'postgres'),
+          database: config.get<string>('POSTGRES_DB', 'wagering'),
+          max: 20,
+          idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 5000,
+        }),
+    },
+  ],
+  exports: ['DATABASE_POOL'],
 })
 export class DatabaseModule {}
