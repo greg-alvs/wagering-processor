@@ -7,6 +7,7 @@ import { WalletsController } from './wallets/wallets.controller';
 import { WalletsService } from './wallets/wallets.service';
 import { WageringController } from './wagering/wagering.controller';
 import { WageringService } from './wagering/wagering.service';
+import { SqsConsumerService } from './infrastructure/messaging/sqs-consumer.service';
 
 @Module({
   imports: [
@@ -17,6 +18,6 @@ import { WageringService } from './wagering/wagering.service';
     DatabaseModule,
   ],
   controllers: [AppController, WalletsController, WageringController],
-  providers: [AppService, WalletsService, WageringService],
+  providers: [AppService, WalletsService, WageringService, SqsConsumerService],
 })
 export class AppModule {}

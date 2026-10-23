@@ -65,6 +65,12 @@ services:
         condition: service_completed_successfully
     env_file:
       - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      SQS_ENDPOINT: http://localstack:4566
+      SQS_MAIN_QUEUE_NAME: ${SQS_MAIN_QUEUE_NAME:-wager-transactions.fifo}
+      SQS_CONSUMER_NAME: ${SQS_CONSUMER_NAME:-wager-transaction-consumer}
     ports:
       - "3000:3000"
     command: bun run start:dev

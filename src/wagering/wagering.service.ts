@@ -1,27 +1,82 @@
-import { Inject, Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
-import { Pool } from 'pg';
+import { HttpException, Inject, Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Pool, PoolClient } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { hashCanonicalJson } from '../domain/idempotency/canonical-payload';
 import { Money } from '../domain/money/money';
 import { Wallet } from '../domain/wallet/wallet';
-import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../domain/wagering/wager-transaction';
+import { WagerTransaction } from '../domain/wagering/wager-transaction';
 import { WagerTransactionProcessor } from '../domain/wagering/wager-transaction-processor';
+import { InboxRepository } from '../infrastructure/messaging/inbox.repository';
 import { CreateWagerTransactionDto } from './dto/create-transaction.dto';
 
 @Injectable()
 export class WageringService {
+  private readonly inboxRepository = new InboxRepository();
+
   constructor(@Inject('DATABASE_POOL') private readonly pool: Pool) {}
 
   async createTransaction(dto: CreateWagerTransactionDto) {
+    return this.processTransaction(dto);
+  }
+
+  async processQueueTransaction(dto: CreateWagerTransactionDto, messageId: string, consumerName: string) {
+    const result = await this.processTransaction(dto, { messageId, consumerName });
+    if ('duplicate' in result) {
+      return result;
+    }
+
+    return { duplicate: false, result };
+  }
+
+  private async processTransaction(
+    dto: CreateWagerTransactionDto,
+    inbox?: { messageId: string; consumerName: string },
+  ) {
+    const client = await this.pool.connect();
+    let transactionStarted = false;
+
+    try {
+      await client.query('BEGIN');
+      transactionStarted = true;
+
+      if (inbox) {
+        const inserted = await this.inboxRepository.tryInsert(client, inbox.consumerName, inbox.messageId);
+        if (!inserted) {
+          await client.query('COMMIT');
+          transactionStarted = false;
+          return { duplicate: true as const };
+        }
+      }
+
+      let result: Awaited<ReturnType<WageringService['processWithinTransaction']>>;
+      try {
+        result = await this.processWithinTransaction(client, dto);
+      } catch (error) {
+        if (inbox && error instanceof HttpException && error.getStatus() >= 400 && error.getStatus() < 500) {
+          await client.query('COMMIT');
+          transactionStarted = false;
+          return { terminalFailure: true as const };
+        }
+        throw error;
+      }
+      await client.query('COMMIT');
+      transactionStarted = false;
+      return result;
+    } catch (error) {
+      if (transactionStarted) {
+        await client.query('ROLLBACK');
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async processWithinTransaction(client: PoolClient, dto: CreateWagerTransactionDto) {
     const money = Money.from(dto.money);
     const payloadHash = hashCanonicalJson(dto);
-    const responseHashSeed = {
-      transactionId: dto.externalTransactionId,
-      status: WagerTransactionStatus.Pending,
-      walletId: dto.walletId,
-    };
 
-    const keyCheck = await this.pool.query(
+    const keyCheck = await client.query(
       'SELECT * FROM idempotency_keys WHERE key = $1 FOR UPDATE',
       [dto.idempotencyKey],
     );
@@ -40,7 +95,7 @@ export class WageringService {
       throw new BadRequestException('Idempotency key already used with different payload.');
     }
 
-    const walletRow = await this.pool.query('SELECT * FROM wallets WHERE id = $1 FOR UPDATE', [dto.walletId]);
+    const walletRow = await client.query('SELECT * FROM wallets WHERE id = $1 FOR UPDATE', [dto.walletId]);
     if (!walletRow.rowCount || walletRow.rowCount === 0) {
       throw new NotFoundException(`Wallet ${dto.walletId} not found.`);
     }
@@ -71,101 +126,73 @@ export class WageringService {
     });
 
     const result = WagerTransactionProcessor.process(wallet, transaction);
-    const transactionRecord = {
-      id: transaction.id,
-      providerId: dto.providerId,
-      externalTransactionId: dto.externalTransactionId,
-      idempotencyKey: dto.idempotencyKey,
-      payloadHash,
-      walletId: dto.walletId,
-      playerId: dto.playerId,
-      roundId: dto.roundId,
-      gameId: dto.gameId,
-      kind: dto.kind,
-      amount: money.toString(),
-      currency: money.currency,
-      referenceExternalTransactionId: dto.referenceExternalTransactionId,
-      status: transaction.status,
-      referenceTransactionId: transaction.referenceTransactionId,
-      failureCode: transaction.failureCode,
-      processedAt: transaction.processedAt,
-    };
+    if (result.ledgerEntry) {
+      await client.query(
+        `UPDATE wallets SET balance = $1, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [result.wallet.balance.toString(), dto.walletId],
+      );
+    }
 
-    await this.pool.query('BEGIN');
-    try {
-      if (result.ledgerEntry) {
-        await this.pool.query(
-          `UPDATE wallets SET balance = $1, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-          [result.wallet.balance.toString(), dto.walletId],
-        );
-      }
-
-      await this.pool.query(
-        `INSERT INTO wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id, round_id, game_id, kind, amount, currency, reference_external_transaction_id, status, reference_transaction_id, failure_code, created_at, processed_at)
+    await client.query(
+      `INSERT INTO wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id, round_id, game_id, kind, amount, currency, reference_external_transaction_id, status, reference_transaction_id, failure_code, created_at, processed_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, CURRENT_TIMESTAMP, $17)`,
+      [
+        transaction.id,
+        dto.providerId,
+        dto.externalTransactionId,
+        dto.idempotencyKey,
+        payloadHash,
+        dto.walletId,
+        dto.playerId,
+        dto.roundId,
+        dto.gameId,
+        dto.kind,
+        money.toString(),
+        money.currency,
+        dto.referenceExternalTransactionId,
+        transaction.status,
+        transaction.referenceTransactionId,
+        transaction.failureCode,
+        transaction.processedAt ?? null,
+      ],
+    );
+
+    if (result.ledgerEntry) {
+      await client.query(
+        `INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
         [
-          transaction.id,
-          dto.providerId,
-          dto.externalTransactionId,
-          dto.idempotencyKey,
-          payloadHash,
+          randomUUID(),
           dto.walletId,
-          dto.playerId,
-          dto.roundId,
-          dto.gameId,
-          dto.kind,
-          money.toString(),
-          money.currency,
-          dto.referenceExternalTransactionId,
-          transaction.status,
-          transaction.referenceTransactionId,
-          transaction.failureCode,
-          transaction.processedAt ?? null,
+          transaction.id,
+          result.ledgerEntry.direction,
+          result.ledgerEntry.money.toString(),
+          result.ledgerEntry.money.currency,
+          result.ledgerEntry.balanceBefore.toString(),
+          result.ledgerEntry.balanceAfter.toString(),
         ],
       );
-
-      if (result.ledgerEntry) {
-        await this.pool.query(
-          `INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
-          [
-            randomUUID(),
-            dto.walletId,
-            transaction.id,
-            result.ledgerEntry.direction,
-            result.ledgerEntry.money.toString(),
-            result.ledgerEntry.money.currency,
-            result.ledgerEntry.balanceBefore.toString(),
-            result.ledgerEntry.balanceAfter.toString(),
-          ],
-        );
-      }
-
-      const responseHash = hashCanonicalJson({
-        transactionId: transaction.id,
-        status: transaction.status,
-        walletBalance: result.wallet.balance.toString(),
-      });
-
-      await this.pool.query(
-        `INSERT INTO idempotency_keys (id, key, payload_hash, response_hash, created_at)
-         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
-        [randomUUID(), dto.idempotencyKey, payloadHash, responseHash],
-      );
-
-      await this.pool.query('COMMIT');
-
-      return {
-        transactionId: transaction.id,
-        walletId: dto.walletId,
-        status: transaction.status,
-        balance: result.wallet.balance.toString(),
-        responseHash,
-      };
-    } catch (error) {
-      await this.pool.query('ROLLBACK');
-      throw error;
     }
+
+    const responseHash = hashCanonicalJson({
+      transactionId: transaction.id,
+      status: transaction.status,
+      walletBalance: result.wallet.balance.toString(),
+    });
+
+    await client.query(
+      `INSERT INTO idempotency_keys (id, key, payload_hash, response_hash, created_at)
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
+      [randomUUID(), dto.idempotencyKey, payloadHash, responseHash],
+    );
+
+    return {
+      transactionId: transaction.id,
+      walletId: dto.walletId,
+      status: transaction.status,
+      balance: result.wallet.balance.toString(),
+      responseHash,
+    };
   }
 
   async getTransaction(transactionId: string) {

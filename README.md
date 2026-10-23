@@ -24,9 +24,18 @@ docker compose up --build
 A migration cria `message_inbox`, com chave única por `(consumer_name, message_id)`.
 O repositório recebe um `PoolClient` transacional e usa `INSERT ... ON CONFLICT`,
 para que a inserção da inbox possa fazer parte da mesma transação do processamento
-financeiro. O consumidor SQS e o ACK após commit serão adicionados na próxima etapa.
+financeiro. O consumidor recebe mensagens FIFO, valida o envelope e reutiliza o caso
+de uso financeiro. A inbox, a transação, o ledger e a atualização da wallet usam o
+mesmo `PoolClient`; a mensagem só é removida da fila depois que o commit termina.
+Falhas técnicas e mensagens inválidas permanecem sem ACK, recebem backoff exponencial
+e são encaminhadas à DLQ pela política de redrive. Falhas de negócio 4xx são
+registradas na inbox e confirmadas antes do ACK. O shutdown aguarda a mensagem em
+processamento e encerra o long poll.
 
 ```powershell
 bunx mikro-orm migration:up
 bun test src/infrastructure/messaging/inbox.repository.spec.ts
 ```
+
+Ao executar a API fora do Compose, configure `LOCALSTACK_HOST=localhost` e
+`LOCALSTACK_PORT=4566`. No Compose, o endpoint SQS aponta para `localstack:4566`.
