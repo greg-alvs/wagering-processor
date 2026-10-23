@@ -48,6 +48,7 @@ services:
       LOCALSTACK_ENDPOINT_URL: http://localstack:4566
       SQS_MAIN_QUEUE_NAME: ${SQS_MAIN_QUEUE_NAME:-wager-transactions.fifo}
       SQS_DLQ_QUEUE_NAME: ${SQS_DLQ_QUEUE_NAME:-wager-transactions-dlq.fifo}
+      SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wager-integration-events.fifo}
       SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
     volumes:
       - ./scripts/init-sqs.sh:/scripts/init-sqs.sh:ro
@@ -70,6 +71,7 @@ services:
       POSTGRES_PORT: 5432
       SQS_ENDPOINT: http://localstack:4566
       SQS_MAIN_QUEUE_NAME: ${SQS_MAIN_QUEUE_NAME:-wager-transactions.fifo}
+      SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wager-integration-events.fifo}
       SQS_CONSUMER_NAME: ${SQS_CONSUMER_NAME:-wager-transaction-consumer}
     ports:
       - "3000:3000"

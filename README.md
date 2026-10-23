@@ -2,9 +2,10 @@
 
 ## SQS local
 
-O Docker Compose inicia o LocalStack, cria a DLQ FIFO e a fila FIFO principal com
-redrive para a DLQ após `SQS_MAX_RECEIVE_COUNT` entregas sem sucesso. A aplicação
-só inicia depois que o bootstrap das filas termina com sucesso.
+O Docker Compose inicia o LocalStack, cria a fila FIFO principal, sua DLQ e uma
+fila FIFO separada para eventos de integração. A fila de entrada redireciona para
+a DLQ após `SQS_MAX_RECEIVE_COUNT` entregas sem sucesso. A aplicação só inicia
+depois que o bootstrap das filas termina com sucesso.
 
 ```powershell
 docker compose up -d postgres localstack sqs-init
@@ -39,3 +40,39 @@ bun test src/infrastructure/messaging/inbox.repository.spec.ts
 
 Ao executar a API fora do Compose, configure `LOCALSTACK_HOST=localhost` e
 `LOCALSTACK_PORT=4566`. No Compose, o endpoint SQS aponta para `localstack:4566`.
+
+## Transactional outbox
+
+Cada transação financeira grava seus eventos de integração na tabela `outbox_events`
+na mesma transação PostgreSQL da wallet, do transaction record, do ledger e (quando
+aplicável) da inbox. O publisher reivindica uma linha por vez com
+`FOR UPDATE SKIP LOCKED`, publica na fila FIFO dedicada `wager-integration-events.fifo`
+e marca `published_at` somente após o SQS confirmar a publicação. Falhas recebem
+backoff exponencial e ficam disponíveis para outro ciclo/instância. Um crash após o
+envio SQS e antes do commit pode gerar redelivery; consumidores devem deduplicar por
+`eventId`.
+
+Eventos gravados: `WagerTransactionProcessed`, `WagerTransactionRejected`,
+`WagerTransactionPendingReference` e `WalletBalanceChanged` somente se houver
+lançamento e mudança de saldo. A fila de eventos é distinta da fila de entrada.
+
+## Reprocessamento de referências pendentes
+
+REFUND e ROLLBACK recebidos antes da transação de referência permanecem em
+`PENDING_REFERENCE`. O worker consulta pendências vencidas no PostgreSQL, usando
+`FOR UPDATE SKIP LOCKED` para coordenar várias instâncias. Ao localizar a
+referência processada, ele trava a wallet e confirma a operação, ledger e eventos
+de outbox numa única transação. Referências ainda ausentes são reagendadas com
+backoff exponencial (1, 2, 4, ... segundos, limitado a 300 segundos), até
+10 tentativas no total ou 24 horas desde a entrada em pendência. Ao esgotar a
+política, a transação é rejeitada com `REFERENCE_NOT_FOUND` e o evento
+`WagerTransactionRejected` é gravado atomicamente. Um índice único parcial e
+uma verificação dentro do lock da wallet permitem somente uma reversão total
+(REFUND ou ROLLBACK) processada por referência; tentativas concorrentes adicionais
+são rejeitadas com `REFERENCE_ALREADY_REVERSED`.
+
+```powershell
+bunx mikro-orm migration:up
+docker compose up -d --build
+docker compose exec localstack awslocal sqs list-queues
+```

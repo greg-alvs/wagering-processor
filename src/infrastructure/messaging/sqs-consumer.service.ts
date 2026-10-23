@@ -4,6 +4,7 @@ import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
   GetQueueUrlCommand,
+  GetQueueAttributesCommand,
   ReceiveMessageCommand,
   SQSClient,
   SQSClientConfig,
@@ -58,6 +59,19 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
     this.stopping = true;
     await this.polling;
     this.client.destroy();
+  }
+
+  async checkReady(): Promise<void> {
+    if (!this.queueUrl) {
+      throw new Error('SQS transaction queue has not been initialized.');
+    }
+
+    await this.client.send(
+      new GetQueueAttributesCommand({
+        QueueUrl: this.queueUrl,
+        AttributeNames: ['QueueArn'],
+      }),
+    );
   }
 
   private async poll(): Promise<void> {

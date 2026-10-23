@@ -39,6 +39,14 @@ dlq_arn="$(
     --output text
 )"
 
+events_url="$(
+  aws_sqs create-queue \
+    --queue-name "$SQS_EVENTS_QUEUE_NAME" \
+    --attributes FifoQueue=true,ContentBasedDeduplication=true \
+    --query QueueUrl \
+    --output text
+)"
+
 attributes_file="$(mktemp)"
 trap 'rm -f "$attributes_file"' EXIT
 printf '{"FifoQueue":"true","ContentBasedDeduplication":"true","RedrivePolicy":"{\\"deadLetterTargetArn\\":\\"%s\\",\\"maxReceiveCount\\":\\"%s\\"}"}' \
@@ -52,4 +60,4 @@ main_url="$(
     --output text
 )"
 
-echo "SQS FIFO queues ready: $SQS_MAIN_QUEUE_NAME ($main_url), $SQS_DLQ_QUEUE_NAME ($dlq_url)"
+echo "SQS FIFO queues ready: $SQS_MAIN_QUEUE_NAME ($main_url), $SQS_DLQ_QUEUE_NAME ($dlq_url), $SQS_EVENTS_QUEUE_NAME ($events_url)"
