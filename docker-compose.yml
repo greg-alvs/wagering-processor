@@ -29,6 +29,29 @@ services:
       - "4566:4566"
     volumes:
       - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  sqs-init:
+    image: amazon/aws-cli:2.27.49
+    depends_on:
+      localstack:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/scripts/init-sqs.sh"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      LOCALSTACK_ENDPOINT_URL: http://localstack:4566
+      SQS_MAIN_QUEUE_NAME: ${SQS_MAIN_QUEUE_NAME:-wager-transactions.fifo}
+      SQS_DLQ_QUEUE_NAME: ${SQS_DLQ_QUEUE_NAME:-wager-transactions-dlq.fifo}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+    volumes:
+      - ./scripts/init-sqs.sh:/scripts/init-sqs.sh:ro
+    restart: "no"
 
   app:
     build:
@@ -38,8 +61,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      localstack:
-        condition: service_started
+      sqs-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     ports:

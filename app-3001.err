@@ -1,1 +1,3 @@
 $ nest start
+Support for driver specific imports in modules defined with `useFactory` and `inject` requires an explicit `driver` option. See https://github.com/mikro-orm/nestjs/pull/204
+^C
