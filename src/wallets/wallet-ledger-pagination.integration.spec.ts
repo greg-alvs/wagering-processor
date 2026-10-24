@@ -44,14 +44,36 @@ describe('Wallet ledger pagination', () => {
     const transactionIds = entryIds.map(() => randomUUID());
 
     try {
-      await pool.query(
-        `INSERT INTO wallet_ledger_entries
-           (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
-         SELECT entry_id, $1, transaction_id, 'CREDIT', 1.00, 'BRL', 0.00, 1.00,
-                '2026-10-23T12:34:56.123456Z'::timestamptz
-         FROM unnest($2::varchar[], $3::varchar[]) AS fixture(entry_id, transaction_id)`,
-        [wallet.id, entryIds, transactionIds],
-      );
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        for (let index = 0; index < entryIds.length; index += 1) {
+          await client.query(
+            `INSERT INTO wager_transactions (
+               id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+               wallet_id, player_id, round_id, game_id, kind, amount, currency,
+               status, created_at, processed_at
+             ) VALUES ($1, 'ledger-pagination-test', $2, $3, 'fixture', $4, $5, 'pagination-round',
+                       'pagination-game', 'WIN', 1.00, 'BRL', 'PROCESSED',
+                       '2026-10-23T12:34:56.123456Z', '2026-10-23T12:34:56.123456Z')`,
+            [transactionIds[index], transactionIds[index], transactionIds[index], wallet.id, wallet.playerId],
+          );
+          await client.query(
+            `INSERT INTO wallet_ledger_entries
+               (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+             VALUES ($1, $2, $3, 'CREDIT', 1.00, 'BRL', $4, $5,
+                     '2026-10-23T12:34:56.123456Z'::timestamptz)`,
+            [entryIds[index], wallet.id, transactionIds[index], index.toFixed(2), (index + 1).toFixed(2)],
+          );
+        }
+        await client.query('UPDATE wallets SET balance = $1 WHERE id = $2', ['4.00', wallet.id]);
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
 
       const firstPage = await walletsController.getLedger(wallet.id, undefined, '2');
       expect(firstPage.entries.map((entry) => entry.id)).toEqual(entryIds.slice().reverse().slice(0, 2));
@@ -67,6 +89,7 @@ describe('Wallet ledger pagination', () => {
       expect(new Set(allIds).size).toBe(4);
     } finally {
       await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
     }
   });
@@ -126,8 +149,8 @@ describe('Wallet ledger pagination', () => {
       expect(truncateTrigger?.definition).toContain('TRUNCATE');
     } finally {
       await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
-      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
     }
   });

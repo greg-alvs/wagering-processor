@@ -10,7 +10,7 @@ import { Pool, PoolClient } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { Money } from '../domain/money/money';
 import { LedgerDirection, WalletLedgerEntry } from '../domain/ledger/ledger-entry';
-import { FailureCode, WagerTransaction, WagerTransactionKind } from '../domain/wagering/wager-transaction';
+import { WagerTransaction, WagerTransactionKind } from '../domain/wagering/wager-transaction';
 import { CreateWalletDto } from './dto/create-wallet.dto';
 import { ApplicationMetrics } from '../infrastructure/observability/application-metrics';
 import { hashCanonicalJson } from '../domain/idempotency/canonical-payload';
@@ -174,7 +174,7 @@ export class WalletsService {
   }
 
   async getLedger(walletId: string, cursor?: string, limitParam?: string) {
-    const wallet = await this.getWallet(walletId);
+    await this.getWallet(walletId);
     const limit = this.parseLedgerLimit(limitParam);
     const position = cursor ? this.decodeLedgerCursor(cursor) : undefined;
 

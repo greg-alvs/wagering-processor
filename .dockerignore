@@ -1,0 +1,12 @@
+.git/
+.vscode/
+node_modules/
+dist/
+coverage/
+logs/
+*.log
+*.err
+*.out
+.env
+.env.*
+!.env.example

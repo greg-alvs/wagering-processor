@@ -61,7 +61,9 @@ describe('WageringService SQS inbox transaction', () => {
     try {
       expect(() => wageringController.createTransaction(payload, undefined)).toThrow(BadRequestException);
 
-      const original = await wageringController.createTransaction(payload, idempotencyKey);
+      const responseStatuses: number[] = [];
+      const response = { status: (statusCode: number) => responseStatuses.push(statusCode) };
+      const original = await wageringController.createTransaction(payload, idempotencyKey, response);
       await wageringController.createTransaction(
         {
           ...payload,
@@ -72,8 +74,9 @@ describe('WageringService SQS inbox transaction', () => {
         secondIdempotencyKey,
       );
 
-      const replay = await wageringController.createTransaction(payload, idempotencyKey);
+      const replay = await wageringController.createTransaction(payload, idempotencyKey, response);
       expect(replay).toEqual({ ...original, idempotentReplay: true });
+      expect(responseStatuses).toEqual([201, 200]);
 
       try {
         await wageringController.createTransaction(
@@ -131,7 +134,7 @@ describe('WageringService SQS inbox transaction', () => {
       const first = await wageringService.processQueueTransaction(request, messageId, consumerName);
       expect(first).toMatchObject({
         duplicate: false,
-        result: { status: 'PROCESSED', balance: '7.00' },
+        result: { status: 'PROCESSED', balance: { amount: '7.00', currency: 'BRL' } },
       });
 
       const redelivery = await wageringService.processQueueTransaction(request, messageId, consumerName);
@@ -158,6 +161,277 @@ describe('WageringService SQS inbox transaction', () => {
       ]);
       await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
       await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
+      await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
+      await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
+    }
+  });
+
+  test('returns one original result for concurrent requests sharing an idempotency key', async () => {
+    const wallet = await walletsService.createWallet({
+      playerId: `player-${randomUUID()}`,
+      initialBalance: { amount: '10.00', currency: 'BRL' },
+    });
+    const idempotencyKey = randomUUID();
+    const payload = {
+      providerId: 'integration-test',
+      externalTransactionId: randomUUID(),
+      playerId: wallet.playerId,
+      walletId: wallet.id,
+      roundId: 'round-idempotency-race',
+      gameId: 'game-idempotency-race',
+      kind: WagerTransactionKind.Bet,
+      money: { amount: '3.00', currency: 'BRL' },
+    };
+
+    try {
+      const results = await Promise.all(
+        Array.from({ length: 20 }, () => wageringController.createTransaction(payload, idempotencyKey)),
+      );
+      expect(results.filter((result) => !('idempotentReplay' in result && result.idempotentReplay))).toHaveLength(1);
+      expect(new Set(results.map((result) => result.transactionId)).size).toBe(1);
+      expect(results.every((result) => result.balance.amount === '7.00')).toBe(true);
+
+      const counts = await pool.query(
+        `SELECT
+           (SELECT count(*) FROM wager_transactions WHERE wallet_id = $1) AS transaction_count,
+           (SELECT count(*) FROM wallet_ledger_entries WHERE wallet_id = $1 AND direction = 'DEBIT') AS debit_count`,
+        [wallet.id],
+      );
+      expect(counts.rows[0]).toEqual({ transaction_count: '2', debit_count: '1' });
+    } finally {
+      await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
+      await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
+      await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
+    }
+  });
+
+  test('processes competing bets under PostgreSQL row locks without overspending', async () => {
+    const wallet = await walletsService.createWallet({
+      playerId: `player-${randomUUID()}`,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+    });
+    const requests = [randomUUID(), randomUUID()].map((suffix) => ({
+      idempotencyKey: randomUUID(),
+      payload: {
+        providerId: 'integration-test',
+        externalTransactionId: `bet-${suffix}`,
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: 'round-wallet-race',
+        gameId: 'game-wallet-race',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '80.00', currency: 'BRL' },
+      },
+    }));
+
+    try {
+      const responseStatuses: number[] = [];
+      const results = await Promise.all(
+        requests.map(({ idempotencyKey, payload }) =>
+          wageringController.createTransaction(payload, idempotencyKey, {
+            status: (statusCode) => responseStatuses.push(statusCode),
+          }),
+        ),
+      );
+      expect(responseStatuses.sort()).toEqual([201, 422]);
+      expect(results.filter((result) => result.status === 'PROCESSED')).toHaveLength(1);
+      expect(results.filter((result) => result.status === 'REJECTED')).toHaveLength(1);
+      expect(results.find((result) => result.status === 'REJECTED')?.failureCode).toBe('INSUFFICIENT_FUNDS');
+
+      const state = await pool.query(
+        `SELECT
+           wallet.balance,
+           count(entry.id) FILTER (WHERE entry.direction = 'DEBIT') AS debit_count
+         FROM wallets wallet
+         LEFT JOIN wallet_ledger_entries entry ON entry.wallet_id = wallet.id
+         WHERE wallet.id = $1
+         GROUP BY wallet.id`,
+        [wallet.id],
+      );
+      expect(state.rows[0]).toEqual({ balance: '20.00', debit_count: '1' });
+      expect((await walletsService.reconcile(wallet.id)).consistent).toBe(true);
+    } finally {
+      await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
+      await pool.query('DELETE FROM idempotency_keys WHERE key = ANY($1::varchar[])', [
+        requests.map(({ idempotencyKey }) => idempotencyKey),
+      ]);
+      await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
+    }
+  });
+
+  test('rejects a transaction when playerId does not own the wallet', async () => {
+    const wallet = await walletsService.createWallet({
+      playerId: `player-${randomUUID()}`,
+      initialBalance: { amount: '10.00', currency: 'BRL' },
+    });
+    const payload = {
+      providerId: 'integration-test',
+      externalTransactionId: randomUUID(),
+      playerId: `another-player-${randomUUID()}`,
+      walletId: wallet.id,
+      roundId: 'round-owner-check',
+      gameId: 'game-owner-check',
+      kind: WagerTransactionKind.Bet,
+      money: { amount: '3.00', currency: 'BRL' },
+    };
+
+    try {
+      await expect(wageringController.createTransaction(payload, randomUUID())).rejects.toMatchObject({
+        status: 400,
+      });
+      expect((await walletsService.getWallet(wallet.id)).balance.amount).toBe('10.00');
+    } finally {
+      await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
+      await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
+    }
+  });
+
+  test('persists a currency mismatch as a rejected transaction without moving the balance', async () => {
+    const wallet = await walletsService.createWallet({
+      playerId: `player-${randomUUID()}`,
+      initialBalance: { amount: '10.00', currency: 'BRL' },
+    });
+    const idempotencyKey = randomUUID();
+    const payload = {
+      providerId: 'integration-test',
+      externalTransactionId: randomUUID(),
+      playerId: wallet.playerId,
+      walletId: wallet.id,
+      roundId: 'round-currency-check',
+      gameId: 'game-currency-check',
+      kind: WagerTransactionKind.Bet,
+      money: { amount: '3.00', currency: 'USD' },
+    };
+
+    try {
+      const result = await wageringController.createTransaction(payload, idempotencyKey);
+      expect(result).toMatchObject({
+        status: 'REJECTED',
+        failureCode: 'CURRENCY_MISMATCH',
+        balance: { amount: '10.00', currency: 'BRL' },
+      });
+      const ledger = await pool.query(
+        `SELECT direction FROM wallet_ledger_entries
+         WHERE wallet_id = $1 AND transaction_id IN (
+           SELECT id FROM wager_transactions WHERE external_transaction_id = $2
+         )`,
+        [wallet.id, payload.externalTransactionId],
+      );
+      expect(ledger.rowCount).toBe(0);
+    } finally {
+      await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
+      await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
+      await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
+    }
+  });
+
+  test('audits a rollback rejected because it would overdraw the wallet', async () => {
+    const wallet = await walletsService.createWallet({
+      playerId: `player-${randomUUID()}`,
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+    });
+    const winExternalId = randomUUID();
+    const betExternalId = randomUUID();
+    const rollbackExternalId = randomUUID();
+    const idempotencyKeys = [randomUUID(), randomUUID(), randomUUID()];
+    const base = {
+      providerId: 'integration-test',
+      playerId: wallet.playerId,
+      walletId: wallet.id,
+      roundId: 'round-rollback-overdraw',
+      gameId: 'game-rollback-overdraw',
+    };
+
+    try {
+      await wageringController.createTransaction(
+        {
+          ...base,
+          externalTransactionId: winExternalId,
+          kind: WagerTransactionKind.Win,
+          money: { amount: '80.00', currency: 'BRL' },
+        },
+        idempotencyKeys[0],
+      );
+      await wageringController.createTransaction(
+        {
+          ...base,
+          externalTransactionId: betExternalId,
+          kind: WagerTransactionKind.Bet,
+          money: { amount: '80.00', currency: 'BRL' },
+        },
+        idempotencyKeys[1],
+      );
+      const rollback = await wageringController.createTransaction(
+        {
+          ...base,
+          externalTransactionId: rollbackExternalId,
+          kind: WagerTransactionKind.Rollback,
+          referenceExternalTransactionId: winExternalId,
+          money: { amount: '80.00', currency: 'BRL' },
+        },
+        idempotencyKeys[2],
+      );
+
+      expect(rollback).toMatchObject({
+        status: 'REJECTED',
+        failureCode: 'REVERSAL_INSUFFICIENT_FUNDS',
+        balance: { amount: '0.00', currency: 'BRL' },
+      });
+      const transaction = await pool.query(
+        'SELECT status, failure_code FROM wager_transactions WHERE external_transaction_id = $1',
+        [rollbackExternalId],
+      );
+      expect(transaction.rows[0]).toEqual({
+        status: 'REJECTED',
+        failure_code: 'REVERSAL_INSUFFICIENT_FUNDS',
+      });
+      expect((await walletsService.reconcile(wallet.id)).consistent).toBe(true);
+    } finally {
+      await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
+      await pool.query('DELETE FROM idempotency_keys WHERE key = ANY($1::varchar[])', [idempotencyKeys]);
+      await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
+    }
+  });
+
+  test('returns HTTP accepted for a transaction waiting on its reference', async () => {
+    const wallet = await walletsService.createWallet({
+      playerId: `player-${randomUUID()}`,
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+    });
+    const idempotencyKey = randomUUID();
+    const responseStatuses: number[] = [];
+
+    try {
+      const result = await wageringController.createTransaction(
+        {
+          providerId: 'integration-test',
+          externalTransactionId: randomUUID(),
+          playerId: wallet.playerId,
+          walletId: wallet.id,
+          roundId: 'round-pending-http',
+          gameId: 'game-pending-http',
+          kind: WagerTransactionKind.Refund,
+          money: { amount: '1.00', currency: 'BRL' },
+          referenceExternalTransactionId: randomUUID(),
+        },
+        idempotencyKey,
+        { status: (statusCode) => responseStatuses.push(statusCode) },
+      );
+      expect(result.status).toBe('PENDING_REFERENCE');
+      expect(responseStatuses).toEqual([202]);
+    } finally {
+      await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
       await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
@@ -382,7 +656,7 @@ describe('WageringService SQS inbox transaction', () => {
       const result = await wageringService.processQueueTransaction(request, messageId, consumerName);
       expect(result).toMatchObject({
         duplicate: false,
-        result: { status: 'PROCESSED', balance: '10.00' },
+        result: { status: 'PROCESSED', balance: { amount: '10.00', currency: 'BRL' } },
       });
 
       const outboxRows = await pool.query(
@@ -402,6 +676,7 @@ describe('WageringService SQS inbox transaction', () => {
         messageId,
       ]);
       await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
       await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
@@ -456,11 +731,11 @@ describe('WageringService SQS inbox transaction', () => {
 
       expect(rejected).toMatchObject({
         duplicate: false,
-        result: { status: 'REJECTED', balance: '10.00' },
+        result: { status: 'REJECTED', balance: { amount: '10.00', currency: 'BRL' } },
       });
       expect(pending).toMatchObject({
         duplicate: false,
-        result: { status: 'PENDING_REFERENCE', balance: '10.00' },
+        result: { status: 'PENDING_REFERENCE', balance: { amount: '10.00', currency: 'BRL' } },
       });
 
       const outboxRows = await pool.query(
@@ -479,6 +754,7 @@ describe('WageringService SQS inbox transaction', () => {
         [rejectionMessageId, pendingMessageId],
       ]);
       await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
       await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM idempotency_keys WHERE key = ANY($1::varchar[])', [[rejectionKey, pendingKey]]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
@@ -524,7 +800,10 @@ describe('WageringService SQS inbox transaction', () => {
       );
       expect(pending).toMatchObject({
         duplicate: false,
-        result: { status: WagerTransactionStatus.PendingReference, balance: '10.00' },
+        result: {
+          status: WagerTransactionStatus.PendingReference,
+          balance: { amount: '10.00', currency: 'BRL' },
+        },
       });
 
       const pendingRow = await pool.query(
@@ -534,7 +813,10 @@ describe('WageringService SQS inbox transaction', () => {
       expect(pendingRow.rows[0].reference_attempts).toBe(1);
 
       const bet = await wageringService.processQueueTransaction(betRequest, betMessageId, consumerName);
-      expect(bet).toMatchObject({ duplicate: false, result: { status: 'PROCESSED', balance: '7.00' } });
+      expect(bet).toMatchObject({
+        duplicate: false,
+        result: { status: 'PROCESSED', balance: { amount: '7.00', currency: 'BRL' } },
+      });
 
       await pool.query(
         'UPDATE wager_transactions SET reference_next_attempt_at = CURRENT_TIMESTAMP WHERE id = $1',
@@ -759,6 +1041,7 @@ describe('WageringService SQS inbox transaction', () => {
         messageId,
       ]);
       await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
       await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
@@ -817,6 +1100,7 @@ describe('WageringService SQS inbox transaction', () => {
         messageId,
       ]);
       await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
       await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);

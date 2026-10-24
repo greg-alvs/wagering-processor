@@ -108,4 +108,76 @@ describe('WagerTransactionProcessor', () => {
     expect(result.wallet.balance.toString()).toBe('40.00');
     expect(result.ledgerEntry?.direction).toBe(LedgerDirection.Credit);
   });
+
+  test('rejects a rollback that would make the wallet balance negative', () => {
+    const wallet = Wallet.open({
+      id: 'wallet-rollback-insufficient',
+      playerId: 'player-rollback-insufficient',
+      initialBalance: Money.zero('BRL'),
+    });
+    const win = WagerTransaction.create({
+      id: 'tx-win-rollback',
+      providerId: 'provider-rollback',
+      externalTransactionId: 'ext-win-rollback',
+      idempotencyKey: 'idem-win-rollback',
+      payloadHash: 'hash-win-rollback',
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      roundId: 'round-rollback',
+      gameId: 'game-rollback',
+      kind: WagerTransactionKind.Win,
+      money: Money.from({ amount: '80.00', currency: 'BRL' }),
+    });
+    win.markProcessed(undefined, new Date());
+
+    const rollback = WagerTransaction.create({
+      id: 'tx-rollback-win',
+      providerId: 'provider-rollback',
+      externalTransactionId: 'ext-rollback-win',
+      idempotencyKey: 'idem-rollback-win',
+      payloadHash: 'hash-rollback-win',
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      roundId: 'round-rollback',
+      gameId: 'game-rollback',
+      kind: WagerTransactionKind.Rollback,
+      money: Money.from({ amount: '80.00', currency: 'BRL' }),
+      referenceExternalTransactionId: win.externalTransactionId,
+    });
+
+    const result = WagerTransactionProcessor.process(wallet, rollback, win);
+
+    expect(result.transaction.status).toBe(WagerTransactionStatus.Rejected);
+    expect(result.transaction.failureCode).toBe(FailureCode.ReversalInsufficientFunds);
+    expect(result.wallet.balance.toString()).toBe('0.00');
+    expect(result.ledgerEntry).toBeUndefined();
+  });
+
+  test('rejects a transaction whose currency does not match the wallet', () => {
+    const wallet = Wallet.open({
+      id: 'wallet-currency-mismatch',
+      playerId: 'player-currency-mismatch',
+      initialBalance: Money.from({ amount: '10.00', currency: 'BRL' }),
+    });
+    const transaction = WagerTransaction.create({
+      id: 'tx-currency-mismatch',
+      providerId: 'provider-currency-mismatch',
+      externalTransactionId: 'ext-currency-mismatch',
+      idempotencyKey: 'idem-currency-mismatch',
+      payloadHash: 'hash-currency-mismatch',
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      roundId: 'round-currency-mismatch',
+      gameId: 'game-currency-mismatch',
+      kind: WagerTransactionKind.Bet,
+      money: Money.from({ amount: '1.00', currency: 'USD' }),
+    });
+
+    const result = WagerTransactionProcessor.process(wallet, transaction);
+
+    expect(result.transaction.status).toBe(WagerTransactionStatus.Rejected);
+    expect(result.transaction.failureCode).toBe(FailureCode.CurrencyMismatch);
+    expect(result.wallet.balance.toString()).toBe('10.00');
+    expect(result.ledgerEntry).toBeUndefined();
+  });
 });

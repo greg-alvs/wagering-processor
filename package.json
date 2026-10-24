@@ -9,8 +9,8 @@
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main",
-    "test": "jest",
+    "start:prod": "bun dist/main.js",
+    "test": "bun test",
     "lint": "eslint . --ext .ts"
   },
   "dependencies": {
@@ -31,15 +31,17 @@
     "rxjs": "^7.8.2"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@mikro-orm/cli": "^7.2.5",
     "@nestjs/cli": "^12.0.10",
     "@nestjs/schematics": "^12.0.10",
     "@types/bun": "^1.4.3",
     "@types/node": "^26.6.5",
     "@types/pg": "^8.23.1",
-    "jest": "^30.5.2",
-    "ts-jest": "^29.4.15",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
     "ts-node": "^10.9.2",
-    "typescript": "5.9.2"
+    "typescript": "5.9.2",
+    "typescript-eslint": "^8.72.0"
   }
 }

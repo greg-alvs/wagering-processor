@@ -25,6 +25,7 @@ export enum FailureCode {
   InvalidTransactionKind = 'INVALID_TRANSACTION_KIND',
   ReferenceNotFound = 'REFERENCE_NOT_FOUND',
   ReferenceAlreadyReversed = 'REFERENCE_ALREADY_REVERSED',
+  ReversalInsufficientFunds = 'REVERSAL_INSUFFICIENT_FUNDS',
   CurrencyMismatch = 'CURRENCY_MISMATCH',
 }
 

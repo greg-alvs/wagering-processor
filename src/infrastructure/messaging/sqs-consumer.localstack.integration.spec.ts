@@ -5,7 +5,6 @@ import {
   DeleteMessageCommand,
   DeleteQueueCommand,
   GetQueueAttributesCommand,
-  GetQueueUrlCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
   SQSClient,
@@ -49,7 +48,7 @@ const applicationDatabase = new Pool({
   database: process.env.POSTGRES_DB ?? 'wagering',
 });
 const walletsService = new WalletsService(applicationDatabase);
-let queueUrls: string[] = [];
+const queueUrls: string[] = [];
 let dlqUrl: string;
 let consumers: SqsConsumerService[] = [];
 
@@ -398,8 +397,8 @@ describeLocalStack('SQS consumer with LocalStack', () => {
           [consumerNames, queueMessageId],
         );
         await database.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
-        await database.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
         await deleteLedgerEntriesForTest(wallet.id);
+        await database.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
         await database.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
       }
     },

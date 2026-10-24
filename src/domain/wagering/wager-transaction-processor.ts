@@ -1,7 +1,6 @@
-import { Money } from '../money/money';
 import { Wallet } from '../wallet/wallet';
 import { WalletLedgerEntry, LedgerDirection } from '../ledger/ledger-entry';
-import { FailureCode, WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from './wager-transaction';
+import { FailureCode, WagerTransaction, WagerTransactionKind } from './wager-transaction';
 
 export type TransactionProcessingResult = {
   wallet: Wallet;
@@ -36,6 +35,11 @@ export class WagerTransactionProcessor {
   }
 
   static process(wallet: Wallet, transaction: WagerTransaction, reference?: WagerTransaction): TransactionProcessingResult {
+    if (transaction.money.currency !== wallet.currency) {
+      transaction.reject(FailureCode.CurrencyMismatch);
+      return { wallet, transaction };
+    }
+
     if (transaction.kind === WagerTransactionKind.Loss) {
       transaction.markProcessed(undefined, new Date());
       return { wallet, transaction };
@@ -116,6 +120,10 @@ export class WagerTransactionProcessor {
       if (direction === LedgerDirection.Credit) {
         wallet.credit(reference.money);
       } else {
+        if (wallet.balance.isLessThan(reference.money)) {
+          transaction.reject(FailureCode.ReversalInsufficientFunds);
+          return { wallet, transaction };
+        }
         wallet.debit(reference.money);
       }
       const after = wallet.balance;

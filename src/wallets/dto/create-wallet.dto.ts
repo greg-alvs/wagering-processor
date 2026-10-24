@@ -1,9 +1,9 @@
 import { Type } from 'class-transformer';
-import { IsDefined, IsString, Matches, ValidateNested } from 'class-validator';
+import { IsDefined, IsString, Length, Matches, ValidateNested } from 'class-validator';
 
 export class MoneyDto {
   @IsString()
-  @Matches(/^\d+(\.\d{1,2})?$/, { message: 'amount must be a decimal string with up to 2 decimal places' })
+  @Matches(/^\d{1,16}(\.\d{1,2})?$/, { message: 'amount must fit numeric(18,2)' })
   amount: string;
 
   @IsString()
@@ -14,6 +14,7 @@ export class MoneyDto {
 export class CreateWalletDto {
   @IsString()
   @IsDefined()
+  @Length(1, 64)
   playerId: string;
 
   @ValidateNested()

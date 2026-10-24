@@ -97,7 +97,18 @@ describe('Wallet reconciliation', () => {
         checkedEntries: 2,
       });
 
-      await pool.query('UPDATE wallets SET balance = $1 WHERE id = $2', ['79.50', wallet.id]);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query("SET LOCAL session_replication_role = 'replica'");
+        await client.query('UPDATE wallets SET balance = $1 WHERE id = $2', ['79.50', wallet.id]);
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
       const divergence = await walletsService.reconcile(wallet.id);
 
       expect(divergence).toMatchObject({

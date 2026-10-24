@@ -5,7 +5,6 @@ import {
   DeleteMessageCommand,
   DeleteQueueCommand,
   GetQueueAttributesCommand,
-  GetQueueUrlCommand,
   ReceiveMessageCommand,
   SQSClient,
 } from '@aws-sdk/client-sqs';

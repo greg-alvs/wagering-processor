@@ -105,29 +105,17 @@ export class Money {
     }
 
     const trimmed = amount.trim();
-    if (!Number.isFinite(Number(trimmed)) || /[eE]/.test(trimmed)) {
+    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(trimmed);
+    if (!match) {
       throw new Error(`Invalid amount for ${currency}: not a valid decimal string.`);
     }
 
-    if (trimmed.startsWith('+') || trimmed.startsWith('-')) {
-      throw new Error(`Invalid amount for ${currency}: negative values are not allowed for input.`);
+    const normalizedWhole = BigInt(match[1]);
+    if (normalizedWhole > 9999999999999999n) {
+      throw new Error(`Invalid amount for ${currency}: exceeds numeric(18,2) precision.`);
     }
 
-    const [wholePart, decimalPart = ''] = trimmed.split('.');
-    if (!/^\d+$/.test(wholePart)) {
-      throw new Error(`Invalid amount for ${currency}: whole part must be numeric.`);
-    }
-
-    if (decimalPart.length > 2) {
-      throw new Error(`Invalid amount for ${currency}: more than 2 decimal places are not allowed.`);
-    }
-
-    if (decimalPart.length > 0 && !/^\d+$/.test(decimalPart)) {
-      throw new Error(`Invalid amount for ${currency}: decimal part must be numeric.`);
-    }
-
-    const normalizedWhole = BigInt(wholePart);
-    const normalizedFraction = BigInt(decimalPart.padEnd(2, '0'));
+    const normalizedFraction = BigInt((match[2] ?? '').padEnd(2, '0'));
     return normalizedWhole * 100n + normalizedFraction;
   }
 }

@@ -1,10 +1,10 @@
 import { Type } from 'class-transformer';
-import { IsEnum, IsOptional, IsString, Matches, ValidateNested } from 'class-validator';
+import { IsEnum, IsOptional, IsString, Length, Matches, ValidateNested } from 'class-validator';
 import { WagerTransactionKind } from '../../domain/wagering/wager-transaction';
 
 export class MoneyDto {
   @IsString()
-  @Matches(/^\d+(\.\d{1,2})?$/, { message: 'amount must be a decimal string with up to 2 decimal places' })
+  @Matches(/^\d{1,16}(\.\d{1,2})?$/, { message: 'amount must fit numeric(18,2)' })
   amount: string;
 
   @IsString()
@@ -14,21 +14,27 @@ export class MoneyDto {
 
 export class CreateWagerTransactionPayloadDto {
   @IsString()
+  @Length(1, 64)
   providerId: string;
 
   @IsString()
+  @Length(1, 128)
   externalTransactionId: string;
 
   @IsString()
+  @Length(1, 36)
   walletId: string;
 
   @IsString()
+  @Length(1, 64)
   playerId: string;
 
   @IsString()
+  @Length(1, 64)
   roundId: string;
 
   @IsString()
+  @Length(1, 64)
   gameId: string;
 
   @IsEnum(WagerTransactionKind)
@@ -40,10 +46,12 @@ export class CreateWagerTransactionPayloadDto {
 
   @IsOptional()
   @IsString()
+  @Length(1, 128)
   referenceExternalTransactionId?: string;
 }
 
 export class CreateWagerTransactionDto extends CreateWagerTransactionPayloadDto {
   @IsString()
+  @Length(1, 128)
   idempotencyKey: string;
 }

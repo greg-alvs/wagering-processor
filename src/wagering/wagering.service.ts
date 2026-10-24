@@ -4,9 +4,9 @@ import {
   HttpException,
   Inject,
   Injectable,
-  InternalServerErrorException,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { Pool, PoolClient } from 'pg';
 import { randomUUID } from 'node:crypto';
@@ -155,6 +155,12 @@ export class WageringService {
           errorCode: this.errorCode(error),
         }),
       );
+      if (!inbox && this.isUniqueViolation(error)) {
+        throw new ConflictException('A transaction with this provider and external transaction ID already exists.');
+      }
+      if (!inbox && this.isTransientInfrastructureError(error)) {
+        throw new ServiceUnavailableException('Transaction processing is temporarily unavailable.');
+      }
       throw error;
     } finally {
       client.release();
@@ -167,10 +173,13 @@ export class WageringService {
     }
 
     const money = Money.from(dto.money);
-    const { idempotencyKey: _idempotencyKey, ...payload } = dto;
+    const payload = Object.fromEntries(
+      Object.entries(dto).filter(([key]) => key !== 'idempotencyKey'),
+    );
     const payloadHash = hashCanonicalJson(payload);
     const legacyPayloadHash = hashCanonicalJson(dto);
 
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [dto.idempotencyKey]);
     const keyCheck = await client.query(
       'SELECT * FROM idempotency_keys WHERE key = $1 FOR UPDATE',
       [dto.idempotencyKey],
@@ -216,6 +225,9 @@ export class WageringService {
       createdAt: walletRow.rows[0].created_at,
       updatedAt: walletRow.rows[0].updated_at,
     });
+    if (wallet.playerId !== dto.playerId) {
+      throw new BadRequestException('The wallet does not belong to the supplied playerId.');
+    }
 
     const transaction = WagerTransaction.create({
       id: randomUUID(),
@@ -323,7 +335,8 @@ export class WageringService {
       transactionId: transaction.id,
       walletId: dto.walletId,
       status: transaction.status,
-      balance: result.wallet.balance.toString(),
+      balance: result.wallet.balance.toJSON(),
+      failureCode: transaction.failureCode ?? null,
       responseHash,
     };
 
@@ -582,6 +595,19 @@ export class WageringService {
     return error instanceof Error ? error.name : undefined;
   }
 
+  private isUniqueViolation(error: unknown): boolean {
+    return typeof error === 'object' && error !== null && 'code' in error && error.code === '23505';
+  }
+
+  private isTransientInfrastructureError(error: unknown): boolean {
+    const code = this.errorCode(error);
+    return Boolean(
+      code &&
+        (/^08/.test(code) ||
+          ['40001', '40P01', '55P03', '57P01', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'].includes(code)),
+    );
+  }
+
   async getTransaction(transactionId: string) {
     const result = await this.pool.query('SELECT * FROM wager_transactions WHERE id = $1', [transactionId]);
     if (!result.rowCount || result.rowCount === 0) {
@@ -594,6 +620,7 @@ export class WageringService {
       providerId: row.provider_id,
       externalTransactionId: row.external_transaction_id,
       status: row.status,
+      failureCode: row.failure_code,
       kind: row.kind,
       amount: row.amount,
       currency: row.currency,
@@ -616,6 +643,7 @@ export class WageringService {
       providerId: row.provider_id,
       externalTransactionId: row.external_transaction_id,
       status: row.status,
+      failureCode: row.failure_code,
       kind: row.kind,
       amount: row.amount,
       currency: row.currency,

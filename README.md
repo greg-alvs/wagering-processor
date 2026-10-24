@@ -23,7 +23,36 @@ long polling do consumidor (0 a 20 segundos, padrão 20). Para executar a entreg
 completa — PostgreSQL, migrations, usuário restrito, LocalStack, filas, API e workers:
 
 ```powershell
+Copy-Item .env.example .env
 docker compose up --build
+```
+
+O `.env.example` contém somente credenciais de desenvolvimento. O `.env` local é
+ignorado pelo Git; use senhas próprias e não reutilize os valores de exemplo fora
+do ambiente local.
+
+Para executar a suíte padrão em container, sem instalar Bun no host:
+
+```powershell
+docker compose run --rm test
+```
+
+Com Bun 1.x instalado no host, as verificações equivalentes são:
+
+```powershell
+bun install --frozen-lockfile
+bun run lint
+bun run build
+bun run test
+```
+
+O serviço `test` tem profile próprio e não inicia com `docker compose up`. Ele
+prepara PostgreSQL, migrations, usuário de runtime e LocalStack como dependências.
+Os testes opt-in com filas reais podem ser executados no mesmo container:
+
+```powershell
+docker compose run --rm -e RUN_LOCALSTACK_INTEGRATION=1 test bun test src/infrastructure/messaging/sqs-consumer.localstack.integration.spec.ts src/infrastructure/outbox/outbox-publisher.localstack.integration.spec.ts
+docker compose run --rm -e RUN_LOCALSTACK_INTEGRATION=1 test bun test src/infrastructure/messaging/worker-crash-recovery.localstack.integration.spec.ts
 ```
 
 O serviço `migrate` usa `POSTGRES_USER`/`POSTGRES_PASSWORD` e não sincroniza
@@ -61,7 +90,14 @@ marcação no PostgreSQL. Com PostgreSQL e LocalStack ativos:
 ```powershell
 $env:RUN_LOCALSTACK_INTEGRATION = "1"
 bun test src/infrastructure/messaging/sqs-consumer.localstack.integration.spec.ts src/infrastructure/outbox/outbox-publisher.localstack.integration.spec.ts
+bun test src/infrastructure/messaging/worker-crash-recovery.localstack.integration.spec.ts
 ```
+
+O teste de recuperação inicia processos worker Bun separados e os encerra à
+força em dois pontos controlados: depois do commit financeiro, antes de o ACK
+chegar ao SQS; e depois de o SQS aceitar um evento da outbox, antes de a resposta
+chegar ao publisher e de `published_at` ser confirmado. Em seguida, reinicia os
+workers e valida redelivery, deduplicação da inbox e recuperação da outbox/FIFO.
 
 Ao executar a API fora do Compose, configure `LOCALSTACK_HOST=localhost` e
 `LOCALSTACK_PORT=4566`. No Compose, o endpoint SQS aponta para `localstack:4566`.
@@ -89,7 +125,7 @@ o serviço não deve ser exposto diretamente sem uma camada de proteção adequa
 
 Uma evolução familiar para este projeto seria usar Keycloak como provedor OAuth
 2.0/OpenID Connect: cadastrar a API como resource server, configurar um realm e
-um client confidencial para clientes, e exigir access tokens Bearer assinados.
+um client confidencial para clientes, e exigir access tokens no formato Bearer.
 A API validaria assinatura via JWKS, `issuer`, `audience`, expiração e claims de
 roles/scopes; guards do NestJS autorizariam ações por escopo e identidade. O
 gateway poderia validar tokens antes de encaminhar tráfego, mantendo a validação
@@ -116,6 +152,13 @@ bunx mikro-orm migration:up
 ```
 
 Mensagens SQS continuam carregando `idempotencyKey` no próprio envelope.
+O endpoint responde `201 Created` para transações processadas, `202 Accepted`
+para estados pendentes, `422 Unprocessable Entity` para rejeições financeiras,
+`200 OK` para replay idempotente, `409 Conflict` para colisões de chave/ID,
+`400 Bad Request` para payload inválido e `503 Service Unavailable` para falhas
+transitórias reconhecidas de infraestrutura. Rejeições persistidas incluem o
+`failureCode` no corpo da resposta; valores monetários são serializados como
+`{ "amount": "975.00", "currency": "BRL" }`.
 
 ## Consulta paginada do ledger
 
@@ -136,6 +179,15 @@ sem relaxar a proteção usada pelo processamento normal. Como em qualquer prote
 por trigger, o superusuário ou proprietário do banco pode desabilitá-los; em
 produção, a credencial da aplicação deve ser limitada e distinta da credencial
 administrativa usada para migrations.
+
+Uma migration adicional aplica constraints para valores monetários positivos,
+transições exatas de saldo nos lançamentos, unicidade de lançamento por
+transação, ownership da wallet pelo player e integridade das referências entre
+transações e ledger. As novas constraints de validação e chaves estrangeiras são
+criadas `NOT VALID` para não apagar nem bloquear a atualização de bancos locais
+com dados legados; elas são aplicadas a todas as novas gravações. Antes de
+validar registros preexistentes em uma instalação antiga, audite e corrija
+eventuais resíduos de testes ou dados históricos.
 
 ## Transactional outbox
 

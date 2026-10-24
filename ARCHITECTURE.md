@@ -39,12 +39,19 @@ casas e representa unidades menores com `bigint`. As tabelas guardam valores em
 `numeric(18,2)`. Wallets impedem saldo negativo no domínio e têm constraint de
 não negatividade no banco.
 
+O payload também é validado contra a precisão de `numeric(18,2)`, sem converter
+valores monetários para `number`. As migrations reforçam os lançamentos com
+constraints de valor/direção/transição do saldo, unicidade por transação e FKs
+para wallet e transação. Constraints de validação e FKs são `NOT VALID` ao
+instalar em bases antigas: novas gravações são protegidas, mas dados anteriores
+precisam ser auditados antes de uma validação explícita.
+
 No processamento HTTP/SQS:
 
 1. O serviço abre uma transação PostgreSQL.
 2. Para SQS, tenta inserir a chave `(consumer_name, message_id)` na inbox.
-3. Consulta a chave de idempotência persistida e valida o hash SHA-256 de JSON
-   canônico.
+3. Obtém um advisory lock transacional pela chave de idempotência, depois
+   valida o hash SHA-256 de JSON canônico e recupera a resposta original.
 4. Trava a wallet com `SELECT ... FOR UPDATE`.
 5. Aplica a regra do domínio, persiste transação, saldo, ledger e eventos de
    outbox.
@@ -164,12 +171,16 @@ Build TypeScript, testes de domínio e integrações com PostgreSQL estão dispo
 via `bun run build` e `bun test`. `docker compose up --build` prepara PostgreSQL,
 aplica migrations, inicializa as credenciais restritas, cria filas e inicia a API
 e os workers. Os testes opt-in
-`sqs-consumer.localstack.integration.spec.ts` e
-`outbox-publisher.localstack.integration.spec.ts` criam filas FIFO temporárias.
-Eles verificam três consumidores independentes, retry após falha transitória,
-commit antes do ACK, redrive à DLQ, dois publishers concorrentes e retomada após
-falha no intervalo entre envio ao SQS e atualização do registro no PostgreSQL.
-Execute-os com `RUN_LOCALSTACK_INTEGRATION=1` e PostgreSQL/LocalStack ativos.
+`sqs-consumer.localstack.integration.spec.ts`,
+`outbox-publisher.localstack.integration.spec.ts` e
+`worker-crash-recovery.localstack.integration.spec.ts` criam filas FIFO
+temporárias. Eles verificam três consumidores independentes, retry após falha
+transitória, commit antes do ACK, redrive à DLQ, publishers concorrentes e crash
+de processos Bun reais: o consumidor cai depois do commit e antes do ACK; o
+publisher cai depois da aceitação do SQS e antes de confirmar `published_at`.
+Após reinício, a inbox suprime o efeito financeiro repetido e a deduplicação FIFO
+evita uma segunda cópia visível do evento. Execute-os com
+`RUN_LOCALSTACK_INTEGRATION=1` e PostgreSQL/LocalStack ativos.
 
 Também foram executadas três instâncias reais da API em containers separados,
 cada uma processando seis mensagens SQS; as 18 transações foram confirmadas no
@@ -180,10 +191,9 @@ processamentos concorrentes com o mesmo `consumerName` e `messageId`; valida
 49 duplicatas e uma única alteração financeira, linha de inbox, transação e
 conjunto de eventos.
 
-Os seguintes cenários oficiais ainda precisam de testes automatizados dedicados:
+O cenário de crash de processo e recuperação foi validado com os workers reais.
+Crash de host/VM e falhas físicas de infraestrutura não são simulados por estes
+testes locais.
 
-- crash real de processo/host nos limites entre commit/ACK e publicação/registro,
-  além de recuperação verificada após reinício do consumidor.
-
-Não se afirma suporte verificado a esses cenários até que os testes correspondentes
-sejam adicionados e executados.
+Não se afirma validação de crash de host/VM ou falhas físicas fora do ambiente
+local composto por PostgreSQL e LocalStack.
