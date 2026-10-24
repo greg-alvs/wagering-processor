@@ -1,4 +1,4 @@
-# wagering-processor
+# Wagering-Processor
 
 Decisões, arquitetura e limitações conhecidas estão documentadas em
 [ARCHITECTURE.md](./ARCHITECTURE.md).
