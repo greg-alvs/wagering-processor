@@ -7,9 +7,9 @@ financeira e SQS FIFO como canal assíncrono. A correção financeira não depen
 de estado local da aplicação: inbox, wallet, transação, ledger e outbox são
 persistidos no PostgreSQL; workers usam locks do banco para coordenar instâncias.
 
-Este documento descreve o comportamento encontrado no código e registra as
-lacunas conhecidas em relação ao desafio. Itens marcados como pendentes não
-devem ser interpretados como funcionalidades concluídas.
+Neste documento, explico as principais decisões que tomei e as limitações que
+ainda conheço. Quando algo não foi implementado ou validado, deixo isso indicado
+para não passar a impressão de que a funcionalidade está concluída.
 
 ## Componentes e dependências
 
@@ -151,21 +151,28 @@ cria o papel e concede DML nos objetos existentes e futuros criados pelo papel
 administrativo de migrations. As credenciais administrativas (`POSTGRES_USER`/
 `POSTGRES_PASSWORD`) não são passadas ao container da API. O papel de runtime não
 é proprietário das tabelas, recebe `SELECT`/`INSERT`/`UPDATE`, não recebe
-`DELETE`/`TRUNCATE` nem privilégios para alterar triggers. O desafio deixa a
-autenticação HTTP a cargo do candidato; esta entrega explicitamente não implementa
-autenticação nem autorização, e não deve ser exposta diretamente em produção sem
-uma camada de proteção.
+`DELETE`/`TRUNCATE` nem privilégios para alterar triggers.
 
-Uma evolução prevista é integrar Keycloak via OAuth 2.0/OpenID Connect. A API
-atuaria como resource server, validando a assinatura dos access tokens Bearer
-via JWKS, `issuer`, `audience`, expiração e roles/scopes, com guards NestJS para
-autorizar operações e associar a identidade às permissões. Um gateway pode
-adicionar validação de borda, sem substituir a autorização no serviço. Segredos
-de clients seriam mantidos em secret manager. Identidades de SQS/workers seriam
-separadas das identidades de usuários, usando IAM/credenciais de serviço; health
-checks poderiam ser limitados à rede interna.
+### Autenticação HTTP
 
-## Validação existente e trabalho pendente
+Não implementei autenticação nem autorização HTTP nesta versão. Como o tempo era
+limitado, priorizei as partes financeiras e o processamento distribuído. Por
+isso, os endpoints não validam credenciais nem associam as operações a uma
+identidade autenticada. Não exporia o serviço diretamente em produção nesse
+estado.
+
+Já utilizei Keycloak e tenho mais familiaridade com essa solução. Se eu fosse
+implementar autenticação neste projeto, usaria Keycloak com OAuth 2.0/OpenID
+Connect. A API validaria tokens de acesso Bearer, verificaria a assinatura via
+JWKS e conferiria `issuer`, `audience`, expiração e claims de roles/scopes.
+Guards do NestJS fariam a autorização das operações. Ainda não existe um guard
+ou outro ponto de extensão de autenticação no código; isso ficaria para uma
+próxima etapa. Também manteria as credenciais de SQS/workers separadas das
+identidades dos usuários, usando
+credenciais próprias de serviço. Dependendo do ambiente, os health checks
+poderiam ficar públicos ou restritos à rede interna.
+
+## Validações feitas e limitações conhecidas
 
 Build TypeScript, testes de domínio e integrações com PostgreSQL estão disponíveis
 via `bun run build` e `bun test`. `docker compose up --build` prepara PostgreSQL,

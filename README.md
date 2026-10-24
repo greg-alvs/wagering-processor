@@ -119,21 +119,21 @@ migration executado no host continua usando `POSTGRES_USER`/`POSTGRES_PASSWORD`.
 
 ## Autenticação HTTP
 
-A entrega deste desafio não implementa autenticação: não há validação de
-credenciais nem controle de acesso por usuário nos endpoints HTTP. Em produção,
-o serviço não deve ser exposto diretamente sem uma camada de proteção adequada.
+Não implementei autenticação nesta versão. O tempo disponível e as prioridades do
+desafio me levaram a concentrar o trabalho nas regras financeiras, concorrência,
+idempotência e processamento de mensagens. Assim, os endpoints HTTP não validam
+credenciais nem controlam o acesso por usuário; em produção, eu não exporia o
+serviço sem uma camada de proteção.
 
-Uma evolução familiar para este projeto seria usar Keycloak como provedor OAuth
-2.0/OpenID Connect: cadastrar a API como resource server, configurar um realm e
-um client confidencial para clientes, e exigir access tokens no formato Bearer.
-A API validaria assinatura via JWKS, `issuer`, `audience`, expiração e claims de
-roles/scopes; guards do NestJS autorizariam ações por escopo e identidade. O
-gateway poderia validar tokens antes de encaminhar tráfego, mantendo a validação
-de autorização também na aplicação. Segredos do client ficariam em um secret
-manager, nunca no repositório. SQS e workers continuariam autenticando-se por IAM
-ou credenciais de serviço, sem reutilizar tokens de usuários. Health checks
-poderiam permanecer públicos ou ser limitados à rede interna, conforme o
-ambiente.
+Já utilizei Keycloak e tenho mais familiaridade com ele. Se fosse implementar
+autenticação neste projeto, seguiria esse caminho usando OAuth 2.0/OpenID Connect:
+configuraria um realm e clientes no Keycloak, e a API validaria access tokens
+Bearer, incluindo assinatura via JWKS, `issuer`, `audience`, expiração e claims
+de roles/scopes. No NestJS, adicionaria guards para autorizar as operações.
+Ainda não implementei esse ponto de extensão no código; seria parte do próximo
+passo. Também manteria as credenciais dos clientes fora do repositório e usaria
+credenciais próprias de serviço para SQS e workers. Os health checks poderiam
+continuar públicos ou ficar restritos à rede interna, conforme o ambiente.
 
 ## Idempotência HTTP
 
