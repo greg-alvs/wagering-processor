@@ -3,9 +3,9 @@ services:
     image: postgres:16-alpine
     container_name: wagering-postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: wagering
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-wagering}
     ports:
       - "5432:5432"
     volumes:
@@ -15,6 +15,41 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  postgres-app-user-init:
+    image: postgres:16-alpine
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "/scripts/init-app-user.sh"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_ADMIN_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_ADMIN_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-wagering}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-wagering_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-local_app_password_change_me}
+    volumes:
+      - ./scripts/init-app-user.sh:/scripts/init-app-user.sh:ro
+    restart: "no"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-wagering}
+    command: ["bunx", "mikro-orm", "migration:up"]
+    restart: "no"
 
   localstack:
     image: localstack/localstack:3.8
@@ -60,19 +95,28 @@ services:
       dockerfile: Dockerfile
     container_name: wagering-app
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres-app-user-init:
+        condition: service_completed_successfully
       sqs-init:
         condition: service_completed_successfully
-    env_file:
-      - .env
     environment:
+      PORT: ${PORT:-3000}
+      NODE_ENV: ${NODE_ENV:-development}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-wagering}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-wagering_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-local_app_password_change_me}
       SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
       SQS_MAIN_QUEUE_NAME: ${SQS_MAIN_QUEUE_NAME:-wager-transactions.fifo}
+      SQS_DLQ_QUEUE_NAME: ${SQS_DLQ_QUEUE_NAME:-wager-transactions-dlq.fifo}
       SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wager-integration-events.fifo}
       SQS_CONSUMER_NAME: ${SQS_CONSUMER_NAME:-wager-transaction-consumer}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+      SQS_WAIT_TIME_SECONDS: ${SQS_WAIT_TIME_SECONDS:-20}
     ports:
       - "3000:3000"
     command: bun run start:dev

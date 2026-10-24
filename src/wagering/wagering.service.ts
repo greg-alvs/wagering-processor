@@ -1,17 +1,31 @@
-import { BadRequestException, HttpException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  HttpException,
+  Inject,
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { Pool, PoolClient } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { hashCanonicalJson } from '../domain/idempotency/canonical-payload';
 import { Money } from '../domain/money/money';
 import { Wallet } from '../domain/wallet/wallet';
-import { FailureCode, WagerTransaction, WagerTransactionStatus } from '../domain/wagering/wager-transaction';
+import {
+  FailureCode,
+  WagerTransaction,
+  WagerTransactionKind,
+  WagerTransactionStatus,
+} from '../domain/wagering/wager-transaction';
 import { TransactionProcessingResult, WagerTransactionProcessor } from '../domain/wagering/wager-transaction-processor';
 import { InboxRepository } from '../infrastructure/messaging/inbox.repository';
 import { EventContext } from '../infrastructure/outbox/integration-event';
 import { OutboxRepository } from '../infrastructure/outbox/outbox.repository';
 import { eventsForTransaction, WalletBalanceChanged } from '../infrastructure/outbox/wager-transaction-events';
 import { ApplicationMetrics } from '../infrastructure/observability/application-metrics';
-import { CreateWagerTransactionDto } from './dto/create-transaction.dto';
+import { CreateWagerTransactionDto, CreateWagerTransactionPayloadDto } from './dto/create-transaction.dto';
 
 @Injectable()
 export class WageringService {
@@ -21,8 +35,16 @@ export class WageringService {
 
   constructor(@Inject('DATABASE_POOL') private readonly pool: Pool) {}
 
-  async createTransaction(dto: CreateWagerTransactionDto) {
-    return this.processTransaction(dto, undefined, { correlationId: randomUUID() });
+  async createTransaction(dto: CreateWagerTransactionPayloadDto, idempotencyKey: string) {
+    if (!idempotencyKey.trim() || idempotencyKey.length > 128) {
+      throw new BadRequestException('A valid Idempotency-Key header is required.');
+    }
+
+    return this.processTransaction(
+      { ...dto, idempotencyKey },
+      undefined,
+      { correlationId: randomUUID() },
+    );
   }
 
   async processQueueTransaction(dto: CreateWagerTransactionDto, messageId: string, consumerName: string) {
@@ -99,14 +121,13 @@ export class WageringService {
           (performance.now() - startedAt) / 1000,
           { source },
         );
-        const { idempotentReplay: _idempotentReplay, ...originalResult } = result;
         this.logTransaction('idempotent_replay', dto, eventContext, {
-          status: originalResult.status,
-          responseHash: originalResult.responseHash,
+          status: result.status,
+          responseHash: result.responseHash,
         }, {
           messageId: inbox?.messageId,
         });
-        return originalResult;
+        return result;
       }
       const status = 'status' in result ? String(result.status) : undefined;
       if (status) {
@@ -141,8 +162,14 @@ export class WageringService {
   }
 
   private async processWithinTransaction(client: PoolClient, dto: CreateWagerTransactionDto, eventContext: EventContext) {
+    if (dto.kind === WagerTransactionKind.Opening) {
+      throw new BadRequestException('OPENING transactions can only be created with a wallet.');
+    }
+
     const money = Money.from(dto.money);
-    const payloadHash = hashCanonicalJson(dto);
+    const { idempotencyKey: _idempotencyKey, ...payload } = dto;
+    const payloadHash = hashCanonicalJson(payload);
+    const legacyPayloadHash = hashCanonicalJson(dto);
 
     const keyCheck = await client.query(
       'SELECT * FROM idempotency_keys WHERE key = $1 FOR UPDATE',
@@ -151,17 +178,22 @@ export class WageringService {
 
     if (keyCheck.rowCount && keyCheck.rowCount > 0) {
       const row = keyCheck.rows[0];
-      const samePayload = row.payload_hash === payloadHash;
+      const samePayload = row.payload_hash === payloadHash || row.payload_hash === legacyPayloadHash;
       if (samePayload) {
+        const responseBody = row.response_body;
+        if (!responseBody || typeof responseBody !== 'object' || Array.isArray(responseBody)) {
+          throw new ConflictException(
+            'This idempotency record predates response snapshots and cannot be replayed safely.',
+          );
+        }
+
         return {
+          ...responseBody,
           idempotentReplay: true as const,
-          id: row.id,
-          status: row.response_hash ? 'PROCESSED' : 'PENDING',
-          responseHash: row.response_hash,
         };
       }
 
-      throw new BadRequestException('Idempotency key already used with different payload.');
+      throw new ConflictException('Idempotency key already used with different payload.');
     }
 
     const walletLockStartedAt = performance.now();
@@ -287,24 +319,25 @@ export class WageringService {
       status: transaction.status,
       walletBalance: result.wallet.balance.toString(),
     });
-
-    await client.query(
-      `INSERT INTO idempotency_keys (id, key, payload_hash, response_hash, created_at)
-         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
-      [randomUUID(), dto.idempotencyKey, payloadHash, responseHash],
-    );
-
-    for (const event of events) {
-      await this.outboxRepository.append(client, event);
-    }
-
-    return {
+    const response = {
       transactionId: transaction.id,
       walletId: dto.walletId,
       status: transaction.status,
       balance: result.wallet.balance.toString(),
       responseHash,
     };
+
+    await client.query(
+      `INSERT INTO idempotency_keys (id, key, payload_hash, response_hash, response_body, created_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, CURRENT_TIMESTAMP)`,
+      [randomUUID(), dto.idempotencyKey, payloadHash, responseHash, JSON.stringify(response)],
+    );
+
+    for (const event of events) {
+      await this.outboxRepository.append(client, event);
+    }
+
+    return response;
   }
 
   async reprocessPendingReference(

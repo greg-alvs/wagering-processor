@@ -93,6 +93,23 @@
           "enumItems": [],
           "mappedType": "string"
         },
+        "response_body": {
+          "name": "response_body",
+          "type": "jsonb",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "json"
+        },
         "response_hash": {
           "name": "response_hash",
           "type": "varchar(128)",
@@ -1119,7 +1136,18 @@
         }
       ],
       "checks": [],
-      "triggers": [],
+      "triggers": [
+        {
+          "name": "wallet_ledger_entries_immutable_row",
+          "timing": "before",
+          "events": [
+            "delete",
+            "update"
+          ],
+          "forEach": "row",
+          "body": ""
+        }
+      ],
       "foreignKeys": {},
       "comment": null
     },

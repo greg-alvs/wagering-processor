@@ -1,8 +1,10 @@
 import { afterAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
+import { BadRequestException } from '@nestjs/common';
 import { WagerTransactionKind, WagerTransactionStatus } from '../../domain/wagering/wager-transaction';
 import { PendingReferenceWorkerService } from './pending-reference-worker.service';
+import { WageringController } from '../../wagering/wagering.controller';
 import { WageringService } from '../../wagering/wagering.service';
 import { WalletsService } from '../../wallets/wallets.service';
 
@@ -16,12 +18,94 @@ const pool = new Pool({
 const wageringService = new WageringService(pool);
 const pendingReferenceWorker = new PendingReferenceWorkerService(pool, wageringService);
 const walletsService = new WalletsService(pool);
+const wageringController = new WageringController(wageringService);
+
+async function deleteLedgerEntriesForTest(walletId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SET LOCAL session_replication_role = 'replica'");
+    await client.query('DELETE FROM wallet_ledger_entries WHERE wallet_id = $1', [walletId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 afterAll(async () => {
   await pool.end();
 });
 
 describe('WageringService SQS inbox transaction', () => {
+  test('replays the original HTTP response for an identical idempotency key and conflicts on a changed payload', async () => {
+    const wallet = await walletsService.createWallet({
+      playerId: `player-${randomUUID()}`,
+      initialBalance: { amount: '10.00', currency: 'BRL' },
+    });
+    const idempotencyKey = randomUUID();
+    const secondIdempotencyKey = randomUUID();
+    const payload = {
+      providerId: 'integration-test',
+      externalTransactionId: randomUUID(),
+      playerId: wallet.playerId,
+      walletId: wallet.id,
+      roundId: 'round-1',
+      gameId: 'game-1',
+      kind: WagerTransactionKind.Bet,
+      money: { amount: '3.00', currency: 'BRL' },
+    };
+
+    try {
+      expect(() => wageringController.createTransaction(payload, undefined)).toThrow(BadRequestException);
+
+      const original = await wageringController.createTransaction(payload, idempotencyKey);
+      await wageringController.createTransaction(
+        {
+          ...payload,
+          externalTransactionId: randomUUID(),
+          kind: WagerTransactionKind.Win,
+          money: { amount: '2.00', currency: 'BRL' },
+        },
+        secondIdempotencyKey,
+      );
+
+      const replay = await wageringController.createTransaction(payload, idempotencyKey);
+      expect(replay).toEqual({ ...original, idempotentReplay: true });
+
+      try {
+        await wageringController.createTransaction(
+          { ...payload, money: { amount: '4.00', currency: 'BRL' } },
+          idempotencyKey,
+        );
+        throw new Error('Expected a conflict for a changed payload.');
+      } catch (error) {
+        expect(error).toMatchObject({ status: 409 });
+      }
+
+      const transactionRows = await pool.query(
+        'SELECT count(*) AS count FROM wager_transactions WHERE wallet_id = $1',
+        [wallet.id],
+      );
+      const ledgerRows = await pool.query(
+        'SELECT count(*) AS count FROM wallet_ledger_entries WHERE wallet_id = $1',
+        [wallet.id],
+      );
+      expect(transactionRows.rows[0].count).toBe('3');
+      expect(ledgerRows.rows[0].count).toBe('3');
+    } finally {
+      await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
+      await pool.query('DELETE FROM idempotency_keys WHERE key = ANY($1::varchar[])', [
+        [idempotencyKey, secondIdempotencyKey],
+      ]);
+      await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
+    }
+  });
+
   test('commits inbox and financial effects together and suppresses redelivery', async () => {
     const wallet = await walletsService.createWallet({
       playerId: `player-${randomUUID()}`,
@@ -60,9 +144,11 @@ describe('WageringService SQS inbox transaction', () => {
         [wallet.id],
       );
       expect(String(walletRow.rows[0].balance)).toBe('7.00');
-      expect(ledgerRows.rowCount).toBe(1);
+      expect(ledgerRows.rowCount).toBe(2);
       expect(outboxRows.rows.map((row) => row.event_type)).toEqual([
         'WagerTransactionProcessed',
+        'WagerTransactionProcessed',
+        'WalletBalanceChanged',
         'WalletBalanceChanged',
       ]);
     } finally {
@@ -71,7 +157,78 @@ describe('WageringService SQS inbox transaction', () => {
         messageId,
       ]);
       await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
-      await pool.query('DELETE FROM wallet_ledger_entries WHERE wallet_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
+      await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
+      await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
+      await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
+    }
+  });
+
+  test('suppresses 50 concurrent redeliveries of the same message', async () => {
+    const wallet = await walletsService.createWallet({
+      playerId: `player-${randomUUID()}`,
+      initialBalance: { amount: '10.00', currency: 'BRL' },
+    });
+    const consumerName = `test-${randomUUID()}`;
+    const messageId = randomUUID();
+    const externalTransactionId = randomUUID();
+    const idempotencyKey = randomUUID();
+    const request = {
+      providerId: 'integration-test',
+      externalTransactionId,
+      idempotencyKey,
+      playerId: wallet.playerId,
+      walletId: wallet.id,
+      roundId: 'round-1',
+      gameId: 'game-1',
+      kind: WagerTransactionKind.Bet,
+      money: { amount: '3.00', currency: 'BRL' },
+    };
+
+    try {
+      const results = await Promise.all(
+        Array.from({ length: 50 }, () =>
+          wageringService.processQueueTransaction(request, messageId, consumerName),
+        ),
+      );
+      const accepted = results.filter((result) => 'duplicate' in result && !result.duplicate);
+      const duplicates = results.filter((result) => 'duplicate' in result && result.duplicate);
+
+      expect(accepted).toHaveLength(1);
+      expect(duplicates).toHaveLength(49);
+
+      const walletRow = await pool.query('SELECT balance FROM wallets WHERE id = $1', [wallet.id]);
+      const inboxRows = await pool.query(
+        'SELECT count(*) AS count FROM message_inbox WHERE consumer_name = $1 AND message_id = $2',
+        [consumerName, messageId],
+      );
+      const transactionRows = await pool.query(
+        'SELECT count(*) AS count FROM wager_transactions WHERE wallet_id = $1 AND external_transaction_id = $2',
+        [wallet.id, externalTransactionId],
+      );
+      const ledgerRows = await pool.query('SELECT id FROM wallet_ledger_entries WHERE wallet_id = $1', [wallet.id]);
+      const outboxRows = await pool.query(
+        'SELECT event_type FROM outbox_events WHERE aggregate_id = $1 ORDER BY event_type',
+        [wallet.id],
+      );
+
+      expect(String(walletRow.rows[0].balance)).toBe('7.00');
+      expect(inboxRows.rows[0].count).toBe('1');
+      expect(transactionRows.rows[0].count).toBe('1');
+      expect(ledgerRows.rowCount).toBe(2);
+      expect(outboxRows.rows.map((row) => row.event_type)).toEqual([
+        'WagerTransactionProcessed',
+        'WagerTransactionProcessed',
+        'WalletBalanceChanged',
+        'WalletBalanceChanged',
+      ]);
+    } finally {
+      await pool.query('DELETE FROM message_inbox WHERE consumer_name = $1 AND message_id = $2', [
+        consumerName,
+        messageId,
+      ]);
+      await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
       await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
@@ -109,11 +266,19 @@ describe('WageringService SQS inbox transaction', () => {
       );
       const walletRow = await pool.query('SELECT balance FROM wallets WHERE id = $1', [wallet.id]);
       const outboxRows = await pool.query('SELECT event_id FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
+      const openingLedger = await pool.query(
+        `SELECT transaction.kind, entry.direction
+         FROM wallet_ledger_entries entry
+         JOIN wager_transactions transaction ON transaction.id = entry.transaction_id
+         WHERE entry.wallet_id = $1`,
+        [wallet.id],
+      );
       expect(inboxRow.rowCount).toBe(0);
       expect(String(walletRow.rows[0].balance)).toBe('10.00');
-      expect(outboxRows.rowCount).toBe(0);
+      expect(outboxRows.rowCount).toBe(2);
+      expect(openingLedger.rows).toEqual([{ kind: 'OPENING', direction: 'CREDIT' }]);
     } finally {
-      await pool.query('DELETE FROM wallet_ledger_entries WHERE wallet_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
       await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM idempotency_keys WHERE key = $1', [idempotencyKey]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
@@ -149,6 +314,50 @@ describe('WageringService SQS inbox transaction', () => {
     }
   });
 
+  test('does not allow external OPENING transactions', async () => {
+    const wallet = await walletsService.createWallet({
+      playerId: `player-${randomUUID()}`,
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+    });
+    const consumerName = `test-${randomUUID()}`;
+    const messageId = randomUUID();
+    const idempotencyKey = randomUUID();
+    const externalTransactionId = randomUUID();
+
+    try {
+      const result = await wageringService.processQueueTransaction(
+        {
+          providerId: 'integration-test',
+          externalTransactionId,
+          idempotencyKey,
+          playerId: wallet.playerId,
+          walletId: wallet.id,
+          roundId: 'round-1',
+          gameId: 'game-1',
+          kind: WagerTransactionKind.Opening,
+          money: { amount: '5.00', currency: 'BRL' },
+        },
+        messageId,
+        consumerName,
+      );
+      expect(result).toEqual({ duplicate: false, result: { terminalFailure: true } });
+
+      const records = await pool.query(
+        `SELECT
+           (SELECT count(*) FROM wager_transactions WHERE external_transaction_id = $1) AS transactions,
+           (SELECT count(*) FROM wallet_ledger_entries WHERE wallet_id = $2) AS entries`,
+        [externalTransactionId, wallet.id],
+      );
+      expect(records.rows[0]).toMatchObject({ transactions: '0', entries: '0' });
+    } finally {
+      await pool.query('DELETE FROM message_inbox WHERE consumer_name = $1 AND message_id = $2', [
+        consumerName,
+        messageId,
+      ]);
+      await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
+    }
+  });
+
   test('writes a processed event for LOSS without a balance-change event', async () => {
     const wallet = await walletsService.createWallet({
       playerId: `player-${randomUUID()}`,
@@ -181,8 +390,12 @@ describe('WageringService SQS inbox transaction', () => {
         [wallet.id],
       );
       const ledgerRows = await pool.query('SELECT id FROM wallet_ledger_entries WHERE wallet_id = $1', [wallet.id]);
-      expect(outboxRows.rows.map((row) => row.event_type)).toEqual(['WagerTransactionProcessed']);
-      expect(ledgerRows.rowCount).toBe(0);
+      expect(outboxRows.rows.map((row) => row.event_type)).toEqual([
+        'WagerTransactionProcessed',
+        'WagerTransactionProcessed',
+        'WalletBalanceChanged',
+      ]);
+      expect(ledgerRows.rowCount).toBe(1);
     } finally {
       await pool.query('DELETE FROM message_inbox WHERE consumer_name = $1 AND message_id = $2', [
         consumerName,
@@ -256,7 +469,9 @@ describe('WageringService SQS inbox transaction', () => {
       );
       expect(outboxRows.rows.map((row) => row.event_type)).toEqual([
         'WagerTransactionPendingReference',
+        'WagerTransactionProcessed',
         'WagerTransactionRejected',
+        'WalletBalanceChanged',
       ]);
     } finally {
       await pool.query('DELETE FROM message_inbox WHERE consumer_name = $1 AND message_id = ANY($2::varchar[])', [
@@ -348,8 +563,10 @@ describe('WageringService SQS inbox transaction', () => {
         (await pool.query('SELECT id FROM wager_transactions WHERE external_transaction_id = $1', [betExternalId]))
           .rows[0].id,
       );
-      expect(ledgerRows.rowCount).toBe(2);
+      expect(ledgerRows.rowCount).toBe(3);
       expect(outboxRows.rows.map((row) => row.event_type)).toEqual([
+        'WagerTransactionProcessed',
+        'WalletBalanceChanged',
         'WagerTransactionPendingReference',
         'WagerTransactionProcessed',
         'WalletBalanceChanged',
@@ -362,7 +579,7 @@ describe('WageringService SQS inbox transaction', () => {
         [betMessageId, refundMessageId],
       ]);
       await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
-      await pool.query('DELETE FROM wallet_ledger_entries WHERE wallet_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
       await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM idempotency_keys WHERE key = ANY($1::varchar[])', [[betKey, refundKey]]);
       await pool.query('DELETE FROM wallets WHERE id = $1', [wallet.id]);
@@ -458,14 +675,14 @@ describe('WageringService SQS inbox transaction', () => {
         failure_code: 'REFERENCE_ALREADY_REVERSED',
       });
       expect(String(walletRow.rows[0].balance)).toBe('10.00');
-      expect(ledgerRows.rowCount).toBe(2);
+      expect(ledgerRows.rowCount).toBe(3);
     } finally {
       await pool.query(
         'DELETE FROM message_inbox WHERE consumer_name = $1 AND message_id = ANY($2::varchar[])',
         [consumerName, [betMessageId, ...reversals.map((reversal) => reversal.messageId)]],
       );
       await pool.query('DELETE FROM outbox_events WHERE aggregate_id = $1', [wallet.id]);
-      await pool.query('DELETE FROM wallet_ledger_entries WHERE wallet_id = $1', [wallet.id]);
+      await deleteLedgerEntriesForTest(wallet.id);
       await pool.query('DELETE FROM wager_transactions WHERE wallet_id = $1', [wallet.id]);
       await pool.query('DELETE FROM idempotency_keys WHERE key = ANY($1::varchar[])', [
         [betKey, ...reversals.map((reversal) => reversal.idempotencyKey)],

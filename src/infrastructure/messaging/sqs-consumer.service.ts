@@ -20,6 +20,7 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
   private readonly queueName: string;
   private readonly dlqQueueName: string;
   private readonly consumerName: string;
+  private readonly waitTimeSeconds: number;
   private queueUrl: string | undefined;
   private dlqQueueUrl: string | undefined;
   private stopping = false;
@@ -47,6 +48,11 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
     this.queueName = config.get<string>('SQS_MAIN_QUEUE_NAME', 'wager-transactions.fifo');
     this.dlqQueueName = config.get<string>('SQS_DLQ_QUEUE_NAME', 'wager-transactions-dlq.fifo');
     this.consumerName = config.get<string>('SQS_CONSUMER_NAME', 'wager-transaction-consumer');
+    const waitTimeSeconds = Number(config.get<string>('SQS_WAIT_TIME_SECONDS', '20'));
+    if (!Number.isInteger(waitTimeSeconds) || waitTimeSeconds < 0 || waitTimeSeconds > 20) {
+      throw new Error('SQS_WAIT_TIME_SECONDS must be an integer between 0 and 20.');
+    }
+    this.waitTimeSeconds = waitTimeSeconds;
   }
 
   async onModuleInit(): Promise<void> {
@@ -109,7 +115,7 @@ export class SqsConsumerService implements OnModuleInit, OnModuleDestroy {
           new ReceiveMessageCommand({
             QueueUrl: this.queueUrl,
             MaxNumberOfMessages: 1,
-            WaitTimeSeconds: 20,
+            WaitTimeSeconds: this.waitTimeSeconds,
             VisibilityTimeout: 30,
             MessageSystemAttributeNames: ['ApproximateReceiveCount'],
           }),

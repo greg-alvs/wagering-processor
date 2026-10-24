@@ -9,6 +9,7 @@ export const IdempotencyKeyEntity = defineEntity({
     key: { type: 'varchar', length: 128 },
     payloadHash: { type: 'varchar', length: 128, fieldName: 'payload_hash' },
     responseHash: { type: 'varchar', length: 128, fieldName: 'response_hash' },
+    responseBody: { type: 'jsonb', nullable: true, fieldName: 'response_body' },
     createdAt: { type: 'Date', fieldName: 'created_at', defaultRaw: 'CURRENT_TIMESTAMP' },
     completedAt: { type: 'Date', nullable: true, fieldName: 'completed_at' },
   },

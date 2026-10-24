@@ -12,15 +12,12 @@ export class MoneyDto {
   currency: string;
 }
 
-export class CreateWagerTransactionDto {
+export class CreateWagerTransactionPayloadDto {
   @IsString()
   providerId: string;
 
   @IsString()
   externalTransactionId: string;
-
-  @IsString()
-  idempotencyKey: string;
 
   @IsString()
   walletId: string;
@@ -44,4 +41,9 @@ export class CreateWagerTransactionDto {
   @IsOptional()
   @IsString()
   referenceExternalTransactionId?: string;
+}
+
+export class CreateWagerTransactionDto extends CreateWagerTransactionPayloadDto {
+  @IsString()
+  idempotencyKey: string;
 }

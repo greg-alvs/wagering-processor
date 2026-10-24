@@ -33,7 +33,7 @@ export async function parseWagerTransactionMessage(body: string): Promise<Create
 
   const dto = plainToInstance(CreateWagerTransactionDto, envelope.data);
   const errors = await validate(dto, { whitelist: true, forbidNonWhitelisted: true });
-  if (errors.length > 0) {
+  if (errors.length > 0 || typeof dto.idempotencyKey !== 'string' || dto.idempotencyKey.length === 0) {
     throw new PermanentMessageError('Message transaction data failed validation.');
   }
 

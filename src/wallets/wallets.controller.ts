@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, ValidationPipe } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query, ValidationPipe } from '@nestjs/common';
 import { CreateWalletDto } from './dto/create-wallet.dto';
 import { WalletsService } from './wallets.service';
 
@@ -17,8 +17,12 @@ export class WalletsController {
   }
 
   @Get(':walletId/ledger')
-  getLedger(@Param('walletId') walletId: string) {
-    return this.walletsService.getLedger(walletId);
+  getLedger(
+    @Param('walletId') walletId: string,
+    @Query('cursor') cursor?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.walletsService.getLedger(walletId, cursor, limit);
   }
 
   @Post(':walletId/reconciliation')
